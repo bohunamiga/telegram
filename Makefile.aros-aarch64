@@ -20,7 +20,10 @@ SRC := src/main.c core/tg_app.c core/tg_bot.c core/tg_config.c core/tg_console.c
 ENABLE_TLS ?= 0
 ENABLE_GZIP ?= 0
 ENABLE_GZIP_PUFF ?= 1
-SDK_GCC_ROOT ?= $(AROS_TOOLCHAIN)/lib/gcc/aarch64-aros/10.5.0
+SDK_GCC_ROOT ?= $(firstword $(wildcard $(AROS_TOOLCHAIN)/lib/gcc/aarch64-aros/*))
+ifeq ($(SDK_GCC_ROOT),)
+SDK_GCC_ROOT := $(AROS_TOOLCHAIN)/lib/gcc/aarch64-aros
+endif
 
 ifneq ($(AROS_SDK_ROOT),)
 CFLAGS += -D__AROS__
