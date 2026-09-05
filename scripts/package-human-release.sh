@@ -948,7 +948,7 @@ package_one() {
         amigaos4)   echo "$file_output" | grep -q "ELF 32-bit MSB executable, PowerPC" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
         aros-i386)  echo "$file_output" | grep -q "ELF 32-bit LSB relocatable, Intel 80386.*AROS" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
         aros-x86_64) echo "$file_output" | grep -q "ELF 64-bit LSB relocatable, x86-64.*AROS" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
-        aros-aarch64) echo "$file_output" | grep -q "ELF 64-bit LSB relocatable, ARM aarch64.*AROS" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
+        aros-aarch64) echo "$file_output" | grep -Eq "ELF 64-bit .* (ARM aarch64|ARM64|AArch64).*AROS" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
         *) echo "Unknown expected type: $expected" >&2; exit 1 ;;
     esac
 
