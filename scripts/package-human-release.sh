@@ -1083,11 +1083,11 @@ package_one() {
             ppc-morphos|ppc-amigaos) arch_want="PowerPC" ;;
             i386-aros) arch_want="Intel 80386" ;;
             x86_64-aros) arch_want="x86-64" ;;
-            aarch64-aros) arch_want="ARM aarch64" ;;
+            aarch64-aros) arch_want="ARM aarch64|ARM64|AArch64" ;;
             *) arch_want="" ;;
         esac
         if [ -n "$arch_want" ] && \
-           ! file -b "$lhatmp/$AMINET_DRAWER/TelegramAmiga" | grep -q "$arch_want"; then
+           ! file -b "$lhatmp/$AMINET_DRAWER/TelegramAmiga" | grep -Eq "$arch_want"; then
             rm -rf "$lhatmp"
             echo "ERROR $platform: wrong-arch binary inside $lhafile (want $arch_want)" >&2
             exit 1
