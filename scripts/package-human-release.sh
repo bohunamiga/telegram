@@ -33,6 +33,7 @@ MORPHOS_BINARY=${MORPHOS_BINARY:-"$ROOT_DIR/build/morphos-cross/TelegramAmiga"}
 AMIGAOS4_BINARY=${AMIGAOS4_BINARY:-"$ROOT_DIR/build/amigaos4/TelegramAmiga"}
 AROS_I386_BINARY=${AROS_I386_BINARY:-"$ROOT_DIR/build/aros-i386-abiv0/TelegramAmiga"}
 AROS_X86_64_BINARY=${AROS_X86_64_BINARY:-"$ROOT_DIR/build/aros-x86_64/TelegramAmiga"}
+AROS_AARCH64_BINARY=${AROS_AARCH64_BINARY:-"$ROOT_DIR/build/aros-aarch64/TelegramAmiga"}
 
 # --- Aminet artifacts (.lha + .readme) --------------------------------------
 # Aminet requires a real LhA ENCODER (the Mac's lhasa is extract-only); we use
@@ -801,6 +802,9 @@ aminet_meta() {
     aros-x86_64) archtag="x86_64-aros";  archval="i386-aros"
                  lhaname="TelegramAmiga-AROS64"
                  requires="AROS (x86_64) with a TCP/IP stack (AROSTCP)" ;;
+    aros-aarch64) archtag="aarch64-aros";  archval="aarch64-aros"
+                 lhaname="TelegramAmiga-AROSA64"
+                 requires="AROS (aarch64) with a TCP/IP stack (AROSTCP)" ;;
     *) echo "aminet_meta: unknown arch $1" >&2; exit 1 ;;
     esac
     lhaold="comm/tcp/tgamiga.$archtag.lha"
@@ -944,11 +948,12 @@ package_one() {
         amigaos4)   echo "$file_output" | grep -q "ELF 32-bit MSB executable, PowerPC" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
         aros-i386)  echo "$file_output" | grep -q "ELF 32-bit LSB relocatable, Intel 80386.*AROS" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
         aros-x86_64) echo "$file_output" | grep -q "ELF 64-bit LSB relocatable, x86-64.*AROS" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
+        aros-aarch64) echo "$file_output" | grep -Eq "ELF 64-bit .* (ARM aarch64|ARM64|AArch64).*AROS" || { echo "Skipping $platform: $file_output" >&2; return 0; } ;;
         *) echo "Unknown expected type: $expected" >&2; exit 1 ;;
     esac
 
     case "$expected" in
-        amigaos4|aros-i386|aros-x86_64)
+        amigaos4|aros-i386|aros-x86_64|aros-aarch64)
             if ! strings "$binary" | grep -F '$STACK:1048576' >/dev/null; then
                 echo "ERROR $platform: binary lacks the 1 MiB AmigaDOS stack cookie." >&2
                 exit 1
@@ -1078,10 +1083,11 @@ package_one() {
             ppc-morphos|ppc-amigaos) arch_want="PowerPC" ;;
             i386-aros) arch_want="Intel 80386" ;;
             x86_64-aros) arch_want="x86-64" ;;
+            aarch64-aros) arch_want="ARM aarch64|ARM64|AArch64" ;;
             *) arch_want="" ;;
         esac
         if [ -n "$arch_want" ] && \
-           ! file -b "$lhatmp/$AMINET_DRAWER/TelegramAmiga" | grep -q "$arch_want"; then
+           ! file -b "$lhatmp/$AMINET_DRAWER/TelegramAmiga" | grep -Eq "$arch_want"; then
             rm -rf "$lhatmp"
             echo "ERROR $platform: wrong-arch binary inside $lhafile (want $arch_want)" >&2
             exit 1
@@ -1097,6 +1103,7 @@ package_one "MorphOS" "$MORPHOS_BINARY" "morphos" "morphos"
 package_one "AmigaOS 4.x" "$AMIGAOS4_BINARY" "amigaos4" "amigaos4"
 package_one "AROS i386 ABIv0" "$AROS_I386_BINARY" "aros-i386" "aros-i386"
 package_one "AROS x86_64" "$AROS_X86_64_BINARY" "aros-x86_64" "aros-x86_64"
+package_one "AROS aarch64" "$AROS_AARCH64_BINARY" "aros-aarch64" "aros-aarch64"
 package_one "AmigaOS 3.x (68000)" "$AMIGAOS3_68000_BINARY" "amigaos3-68000" "amigaos3"
 
 # --- checksums ---------------------------------------------------------------
@@ -1169,7 +1176,7 @@ fi
 # an Aminet archive in the same directory on a case-insensitive filesystem.
 AROSARCHIVES_ROOT=${AROSARCHIVES_ROOT:-"$PACKAGE_ROOT/arosarchives"}
 write_arosarchives_pair() {
-    # $1 Aminet base (TelegramAmiga-AROS / -AROS64), $2 their file name,
+    # $1 Aminet base (TelegramAmiga-AROS / -AROS64 / -AROSA64), $2 their file name,
     # $3 requirements text
     aa_src="$AMINET_ROOT/$1.lha"
     [ -f "$aa_src" ] || return 0
@@ -1191,14 +1198,16 @@ write_arosarchives_pair() {
         awk 'flip { print } /^$/ && !flip { flip = 1 }' "$AMINET_ROOT/$1.readme"
     } > "$AROSARCHIVES_ROOT/${2}_lha.readme"
 }
-if [ "$AMINET" = "1" ] && { [ -f "$AMINET_ROOT/TelegramAmiga-AROS.lha" ] || [ -f "$AMINET_ROOT/TelegramAmiga-AROS64.lha" ]; }; then
+if [ "$AMINET" = "1" ] && { [ -f "$AMINET_ROOT/TelegramAmiga-AROS.lha" ] || [ -f "$AMINET_ROOT/TelegramAmiga-AROS64.lha" ] || [ -f "$AMINET_ROOT/TelegramAmiga-AROSA64.lha" ]; }; then
     mkdir -p "$AROSARCHIVES_ROOT"
     write_arosarchives_pair TelegramAmiga-AROS telegramamiga.i386-aros \
         "AROS i386 ABIv0 (AROS One, Icaros) with its TCP/IP stack"
     write_arosarchives_pair TelegramAmiga-AROS64 telegramamiga.x86_64-aros-v11 \
         "AROS x86_64 ABIv11 (AROS One x64) with its TCP/IP stack"
+    write_arosarchives_pair TelegramAmiga-AROSA64 telegramamiga.aarch64-aros-v11 \
+        "AROS aarch64 (AROS One ARM) with its TCP/IP stack"
     echo
-    echo "AROS Archives pairs ready in: $AROSARCHIVES_ROOT (2 x .lha + _lha.readme)"
+    echo "AROS Archives pairs ready in: $AROSARCHIVES_ROOT (up to 3 x .lha + _lha.readme)"
     echo "Submit: https://archives.arosworld.org/index.php?function=submit (web form,"
     echo "        no FTP); queue: index.php?function=uploads"
     echo "        Set f_passphrase on OUR uploads (value in SECRETS, never here):"

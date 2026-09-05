@@ -63,6 +63,7 @@ per-architecture IT/EN manuals — and **no private files**.
 | MorphOS | PPC | [morphos-alpha-0.0.92](https://github.com/kaffeine1/telegram-amiga/releases/tag/morphos-alpha-0.0.92) |
 | AROS i386 (ABIv0) | x86 | [aros-i386-alpha-0.0.92](https://github.com/kaffeine1/telegram-amiga/releases/tag/aros-i386-alpha-0.0.92) |
 | AROS x86_64 | x86-64 | [aros-x86_64-alpha-0.0.92](https://github.com/kaffeine1/telegram-amiga/releases/tag/aros-x86_64-alpha-0.0.92) |
+| AROS aarch64 | arm64 | Build from source (`Makefile.aros-aarch64`) |
 
 All releases: <https://github.com/kaffeine1/telegram-amiga/releases> —
 full history in [CHANGELOG.md](CHANGELOG.md) (also bundled in every package
@@ -144,8 +145,9 @@ needs it.
 
 ## Build (developers)
 
-Five lanes — see the `Makefile.*` files and `docs/`: AmigaOS 3.x (m68k clib2),
-AmigaOS 4 (PPC), MorphOS (PPC), AROS i386, AROS x86_64. Host smoke test:
+Six lanes — see the `Makefile.*` files and `docs/`: AmigaOS 3.x (m68k clib2),
+AmigaOS 4 (PPC), MorphOS (PPC), AROS i386, AROS x86_64, AROS aarch64.
+Host smoke test:
 
 ```sh
 make -f Makefile.aros clean all ENABLE_GZIP=0 ENABLE_GZIP_PUFF=1
