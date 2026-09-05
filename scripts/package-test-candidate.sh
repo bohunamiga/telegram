@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Michele Dipace <michele.dipace@kaffeine.net>
 # SPDX-License-Identifier: MIT
 #
-# Assemble one local, five-lane validation candidate. This script never
+# Assemble one local, six-lane validation candidate. This script never
 # publishes a release. AROS media deliberately uses Rock Ridge plus Joliet;
 # CDVDFS does not reliably expose the long executable name without Rock Ridge.
 
@@ -15,10 +15,10 @@ BUILD_ROOT="$ROOT_DIR/build/test-candidates"
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  scripts/package-test-candidate.sh <phase> <os4-label> <aros-i386-label> <aros-x64-label>
+  scripts/package-test-candidate.sh <phase> <os4-label> <aros-i386-label> <aros-x64-label> <aros-aarch64-label>
 
 Example:
-  scripts/package-test-candidate.sh phase-j TG9JOS41 TG9JI391 TG9JX641
+  scripts/package-test-candidate.sh phase-j TG9JOS41 TG9JI391 TG9JX641 TG9JA641
 
 Labels must be new, unique ISO volume names containing only A-Z, 0-9 and _.
 The source tree and index must be clean. This creates local test artifacts only.
@@ -26,12 +26,13 @@ EOF
     exit 2
 }
 
-[ "$#" -eq 4 ] || usage
+[ "$#" -eq 5 ] || usage
 
 PHASE=$1
 OS4_LABEL=$2
 AROS_I386_LABEL=$3
 AROS_X64_LABEL=$4
+AROS_AARCH64_LABEL=$5
 
 case "$PHASE" in
     ''|*[!a-z0-9-]*)
@@ -57,10 +58,14 @@ validate_label() {
 validate_label "$OS4_LABEL"
 validate_label "$AROS_I386_LABEL"
 validate_label "$AROS_X64_LABEL"
+validate_label "$AROS_AARCH64_LABEL"
 
 if [ "$OS4_LABEL" = "$AROS_I386_LABEL" ] || \
    [ "$OS4_LABEL" = "$AROS_X64_LABEL" ] || \
-   [ "$AROS_I386_LABEL" = "$AROS_X64_LABEL" ]; then
+   [ "$OS4_LABEL" = "$AROS_AARCH64_LABEL" ] || \
+   [ "$AROS_I386_LABEL" = "$AROS_X64_LABEL" ] || \
+   [ "$AROS_I386_LABEL" = "$AROS_AARCH64_LABEL" ] || \
+   [ "$AROS_X64_LABEL" = "$AROS_AARCH64_LABEL" ]; then
     echo "ERROR: every ISO label must be unique." >&2
     exit 2
 fi
@@ -87,7 +92,7 @@ if [ -e "$DEST_DIR" ]; then
 fi
 
 mkdir -p "$BUILD_ROOT"
-for label in "$OS4_LABEL" "$AROS_I386_LABEL" "$AROS_X64_LABEL"; do
+for label in "$OS4_LABEL" "$AROS_I386_LABEL" "$AROS_X64_LABEL" "$AROS_AARCH64_LABEL"; do
     previous=$(find "$BUILD_ROOT" -type f -name "$label.iso" -print -quit 2>/dev/null || true)
     if [ -n "$previous" ]; then
         echo "ERROR: ISO label '$label' was already used: $previous" >&2
@@ -125,6 +130,7 @@ move_package "Telegram-morphos-$STAMP" MorphOS
 move_package "Telegram-amigaos4-$STAMP" AmigaOS4
 move_package "Telegram-aros-i386-$STAMP" AROS-i386
 move_package "Telegram-aros-x86_64-$STAMP" AROS-x86_64
+move_package "Telegram-aros-aarch64-$STAMP" AROS-aarch64
 
 cat > "$FINAL_ROOT/TEST-ONLY.txt" <<EOF
 Telegram Amiga 0.0.9 $PHASE validation candidate
@@ -134,7 +140,7 @@ LOCAL VALIDATION ONLY. This is not a release and must not be redistributed.
 No Telegram session is included. First start uses the normal login flow.
 EOF
 
-for drawer in AmigaOS3 MorphOS AmigaOS4 AROS-i386 AROS-x86_64; do
+for drawer in AmigaOS3 MorphOS AmigaOS4 AROS-i386 AROS-x86_64 AROS-aarch64; do
     cp "$FINAL_ROOT/TEST-ONLY.txt" "$FINAL_ROOT/$drawer/TEST-ONLY.txt"
     (cd "$FINAL_ROOT" && zip -qr "$drawer.zip" "$drawer")
 done
@@ -149,6 +155,8 @@ mkisofs -quiet -r -J -V "$AROS_I386_LABEL" \
     -o "$FINAL_ROOT/$AROS_I386_LABEL.iso" "$FINAL_ROOT/AROS-i386"
 mkisofs -quiet -r -J -V "$AROS_X64_LABEL" \
     -o "$FINAL_ROOT/$AROS_X64_LABEL.iso" "$FINAL_ROOT/AROS-x86_64"
+mkisofs -quiet -r -J -V "$AROS_AARCH64_LABEL" \
+    -o "$FINAL_ROOT/$AROS_AARCH64_LABEL.iso" "$FINAL_ROOT/AROS-aarch64"
 
 md5of() {
     if command -v md5 >/dev/null 2>&1; then
@@ -181,11 +189,11 @@ verify_iso_binary() {
     fi
 }
 
-for drawer in AmigaOS3 MorphOS AmigaOS4 AROS-i386 AROS-x86_64; do
+for drawer in AmigaOS3 MorphOS AmigaOS4 AROS-i386 AROS-x86_64 AROS-aarch64; do
     verify_zip "$drawer"
 done
 
-for iso in "$FINAL_ROOT/$AROS_I386_LABEL.iso" "$FINAL_ROOT/$AROS_X64_LABEL.iso"; do
+for iso in "$FINAL_ROOT/$AROS_I386_LABEL.iso" "$FINAL_ROOT/$AROS_X64_LABEL.iso" "$FINAL_ROOT/$AROS_AARCH64_LABEL.iso"; do
     description=$(isoinfo -d -i "$iso")
     echo "$description" | grep -q "Joliet with UCS level"
     echo "$description" | grep -q "Rock Ridge signatures version"
@@ -194,6 +202,7 @@ done
 verify_iso_binary -J "$FINAL_ROOT/$OS4_LABEL.iso" AmigaOS4
 verify_iso_binary -R "$FINAL_ROOT/$AROS_I386_LABEL.iso" AROS-i386
 verify_iso_binary -R "$FINAL_ROOT/$AROS_X64_LABEL.iso" AROS-x86_64
+verify_iso_binary -R "$FINAL_ROOT/$AROS_AARCH64_LABEL.iso" AROS-aarch64
 
 if find "$FINAL_ROOT" -type f -print | \
    grep -qiE 'telegram-(auth|peers|seed|password|token)|phone-code-hash'; then
@@ -204,8 +213,8 @@ fi
 (
     cd "$FINAL_ROOT"
     shasum -a 256 \
-        AmigaOS3.zip MorphOS.zip AmigaOS4.zip AROS-i386.zip AROS-x86_64.zip \
-        "$OS4_LABEL.iso" "$AROS_I386_LABEL.iso" "$AROS_X64_LABEL.iso" \
+        AmigaOS3.zip MorphOS.zip AmigaOS4.zip AROS-i386.zip AROS-x86_64.zip AROS-aarch64.zip \
+        "$OS4_LABEL.iso" "$AROS_I386_LABEL.iso" "$AROS_X64_LABEL.iso" "$AROS_AARCH64_LABEL.iso" \
         > SHA256SUMS.txt
 )
 
@@ -217,3 +226,4 @@ echo "Candidate ready: $DEST_DIR"
 echo "  OS4 ISO:       $OS4_LABEL.iso"
 echo "  AROS i386 ISO: $AROS_I386_LABEL.iso (Rock Ridge + Joliet)"
 echo "  AROS x64 ISO:  $AROS_X64_LABEL.iso (Rock Ridge + Joliet)"
+echo "  AROS aarch64 ISO: $AROS_AARCH64_LABEL.iso (Rock Ridge + Joliet)"

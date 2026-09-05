@@ -56,6 +56,7 @@ verify "os4-alpha-$VERSION"        "*amigaos4*"   build/amigaos4/TelegramAmiga  
 verify "morphos-alpha-$VERSION"    "*morphos*"    build/morphos-cross/TelegramAmiga   "PowerPC"
 verify "aros-i386-alpha-$VERSION"  "*aros-i386*"  build/aros-i386-abiv0/TelegramAmiga "80386"
 verify "aros-x86_64-alpha-$VERSION" "*x86_64*"    build/aros-x86_64/TelegramAmiga     "x86-64"
+verify "aros-aarch64-alpha-$VERSION" "*aarch64*"   build/aros-aarch64/TelegramAmiga    "ARM aarch64"
 
 if [ "$fail" = 0 ]; then
     echo "All published $VERSION assets match the local builds."
