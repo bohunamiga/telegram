@@ -9883,19 +9883,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     int hit = tg_gui_hit_test(state, ctx.inner_w, ctx.inner_h,
                                               ctx.line_h, hx, hy);
 
-                    if (hit >= TG_GUI_HIT_EMOJI_BASE) {
-                        /* an emoji cell: insert it, keep the panel open */
-                        state->emoji_sel = hit - TG_GUI_HIT_EMOJI_BASE;
-                        (void)tg_gui_emoji_pick(state);
-                        tg_gui_window_paint(state, &backend);
-                    } else if (hit == TG_GUI_HIT_EMOJI_BUTTON) {
-                        if (state->emoji_active) {
-                            tg_gui_emoji_close(state);
-                        } else {
-                            tg_gui_emoji_open(state);
-                        }
-                        tg_gui_window_paint(state, &backend);
-                    } else if (hit <= TG_GUI_HIT_MESSAGE_BASE) {
+                    if (hit <= TG_GUI_HIT_MESSAGE_BASE) {
                         int mi = hit <= TG_GUI_HIT_PHOTO_BASE
                             ? TG_GUI_HIT_PHOTO_BASE - hit
                             : TG_GUI_HIT_MESSAGE_BASE - hit;
@@ -10324,6 +10312,42 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     picked_secs = 0UL;
                     hit = tg_gui_hit_test(state, ctx.inner_w, ctx.inner_h,
                                           ctx.line_h, hx, hy);
+                    /* The emoji panel and its button come first: the cell ids
+                       are positive and would otherwise read as chat rows (the
+                       0.0.93 field round: the smiley and the cells answered
+                       only the right button, this code sat in the MENUDOWN
+                       branch). */
+                    if (hit >= TG_GUI_HIT_EMOJI_BASE) {
+                        /* A cell of the panel: insert that glyph and keep
+                           the panel open for the next one. */
+                        state->emoji_sel = hit - TG_GUI_HIT_EMOJI_BASE;
+                        (void)tg_gui_emoji_pick(state);
+                        last_key_time = time(0);
+                        state->cursor_on = 1;
+                        caret_ticks = 0;
+                        tg_gui_window_paint(state, &backend);
+                        continue;
+                    } else if (hit == TG_GUI_HIT_EMOJI_BUTTON) {
+                        /* The smiley between the input and Send toggles the
+                           panel; opening it focuses the composer. */
+                        if (state->emoji_active) {
+                            tg_gui_emoji_close(state);
+                        } else {
+                            tg_gui_emoji_open(state);
+                            state->search_active = 0;
+                            state->in_sel_active = 0;
+                        }
+                        last_key_time = time(0);
+                        state->cursor_on = 1;
+                        caret_ticks = 0;
+                        tg_gui_window_paint(state, &backend);
+                        continue;
+                    } else if (state->emoji_active &&
+                               hit != TG_GUI_HIT_INPUT) {
+                        /* Any other press puts the panel away and then acts
+                           as usual (a caret click keeps it). */
+                        tg_gui_emoji_close(state);
+                    }
                     if (hit <= TG_GUI_HIT_PHOTO_BASE) {
                         int mi = TG_GUI_HIT_PHOTO_BASE - hit;
 

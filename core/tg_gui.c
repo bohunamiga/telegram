@@ -2573,6 +2573,7 @@ int tg_gui_emoji_pick(tg_gui_state *state)
 {
     tg_gui_emoji_geom geo;
     unsigned long glyph;
+    int from_recents;
 
     if (state == 0 || !state->emoji_active) {
         return 0;
@@ -2589,8 +2590,18 @@ int tg_gui_emoji_pick(tg_gui_state *state)
         !tg_gui_composer_insert_emoji(state, glyph)) {
         return 0;
     }
+    from_recents = state->emoji_sel < geo.recents;
     tg_gui_emoji_recent_push(state, glyph);
     tg_gui_emoji_recent_save(state);
+    /* The recents row may have grown by one cell, which shifts every sheet
+       cell right by one: keep the highlight on the glyph that was picked, so
+       a second ENTER (or click) repeats it instead of taking its neighbour.
+       A pick from the recents row moved that glyph to the front. */
+    tg_gui_emoji_geometry(state, tg_gui_emoji_geom_w > 0 ? tg_gui_emoji_geom_w : 640,
+                          tg_gui_emoji_geom_h > 0 ? tg_gui_emoji_geom_h : 256,
+                          tg_gui_emoji_geom_lh > 0 ? tg_gui_emoji_geom_lh : 8,
+                          &geo);
+    state->emoji_sel = from_recents ? 0 : geo.recents + (int)glyph;
     return 1;
 }
 
@@ -4911,6 +4922,17 @@ int tg_gui_self_test(void)
                 strlen(state.input) != 2UL || state.emoji_recent_count != 1 ||
                 state.emoji_recent[0] != (unsigned short)before) {
                 puts("gui self-test: emoji pick / recents");
+                return 2;
+            }
+            /* the new recents row shifted the sheet by one cell: the
+               highlight must still sit on the glyph just picked, and a
+               second pick must repeat it */
+            if (state.emoji_sel != before + 1 || !tg_gui_emoji_pick(&state) ||
+                strlen(state.input) != 4UL || state.input[2] != state.input[0] ||
+                state.input[3] != state.input[1] ||
+                state.emoji_recent_count != 1) {
+                printf("gui self-test: emoji highlight after pick (sel %d, before %d)\n",
+                       state.emoji_sel, before);
                 return 2;
             }
             /* now a recents row exists: repaint and hit its first cell */
