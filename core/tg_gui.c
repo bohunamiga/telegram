@@ -13,6 +13,7 @@
 #include "tg_emoji_sheet.h"
 
 #define TG_GUI_EMOJI_BUTTON_W 22 /* smiley button in the composer row */
+#define TG_GUI_ATTACH_BUTTON_W 22 /* paperclip at the left of the input */
 #define TG_GUI_INPUT_TEXT_PAD 6 /* equal air above and below the glyph block */
 #include "tg_gui_session.h" /* tg_gui_log: crash-safe first-paint trail */
 
@@ -337,9 +338,38 @@ void tg_gui_set_emoji_enabled(tg_gui_state *state, int enabled)
 
 int tg_gui_emoji_inline_size(const tg_gui_state *state, int font_height)
 {
-    /* A 16px picture reduced below 12px is not readable on small fonts. */
-    return state != 0 && state->emoji_enabled && font_height >= 12
-               ? font_height : 0;
+    /* Keep the sheet readable even with Topaz 8. The shared line metrics
+       reserve room for this cell instead of falling back to text. */
+    if (state == 0 || !state->emoji_enabled) {
+        return 0;
+    }
+    return font_height < TG_EMOJI_GLYPH_SIZE ? TG_EMOJI_GLYPH_SIZE : font_height;
+}
+
+int tg_gui_font_line_height(const tg_gui_state *state, int font_height)
+{
+    int cell;
+
+    if (font_height <= 0) {
+        font_height = 8;
+    }
+    cell = tg_gui_emoji_inline_size(state, font_height);
+    return (cell > font_height ? cell : font_height) + 2;
+}
+
+int tg_gui_font_cell_ascent(const tg_gui_state *state, int font_height,
+                            int font_baseline)
+{
+    int cell;
+
+    if (font_height <= 0) {
+        font_height = 8;
+    }
+    if (font_baseline <= 0 || font_baseline > font_height) {
+        font_baseline = font_height;
+    }
+    cell = tg_gui_font_line_height(state, font_height) - 2;
+    return font_baseline + (cell - font_height) / 2;
 }
 
 static int tg_gui_photo_cache_older(const tg_gui_photo_cache_item *a,
@@ -1265,7 +1295,7 @@ int tg_gui_input_click_caret(const tg_gui_state *state,
         return -1;
     }
     sidebar_w = tg_gui_sidebar_w(width);
-    area_x = sidebar_w + 12;
+    area_x = sidebar_w + 12 + TG_GUI_ATTACH_BUTTON_W;
     rows = tg_gui_input_rows(state, backend, width, sidebar_w);
     input_h = (rows * lh) + 14;
     box_top = (height - (lh + 6)) - input_h;
@@ -1307,7 +1337,7 @@ static void tg_gui_paint_search_box(const tg_gui_state *state,
     }
     sidebar_w = tg_gui_sidebar_w(width);
     search_h = lh + 10;
-    sbase = (search_h / 2) + 4;
+    sbase = tg_gui_centred_baseline(backend, 0, search_h);
     backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
                        tg_gui_make_rect(0, 0, sidebar_w, search_h));
     if (state->search_query[0] != '\0') {
@@ -1491,7 +1521,8 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                baseline so it sits at the optical centre between the avatar and
                badge bubbles (the bitmap-font descent makes a baseline-aligned
                name read high). */
-            name_baseline = has_preview ? (y + 4 + lh) : (row_mid + 2);
+            name_baseline = has_preview
+                ? tg_gui_centred_baseline(backend, y + 4, lh) : (row_mid + 2);
 
             badge[0] = '\0';
             badge_w = 0;
@@ -1522,12 +1553,13 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 int preview_limit;
 
                 backend->draw_text(backend, TG_GUI_PEN_TEXT_DIM, sidebar_w - 34,
-                                   y + 4 + lh, chat->time,
+                                   name_baseline, chat->time,
                                    (unsigned long)strlen(chat->time));
                 preview_limit = (chat->unread > 0) ? (badge_x - 4)
                                                    : (sidebar_w - 10);
                 tg_gui_draw_clipped(backend, preview_pen, text_x,
-                                    y + 8 + (2 * lh), chat->preview,
+                                    tg_gui_centred_baseline(backend, y + 8 + lh, lh),
+                                    chat->preview,
                                     preview_limit - text_x);
             }
             if (chat->unread > 0) {
@@ -2180,7 +2212,9 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
             }
             if (!grouped && (y + lh) <= bottom && y >= top) {
                 backend->draw_text(backend, sender_pen + TG_GUI_PEN_COUNT,
-                                   bubble_x + 2, y + lh, message->sender,
+                                   bubble_x + 2,
+                                   tg_gui_centred_baseline(backend, y, lh),
+                                   message->sender,
                                    (unsigned long)strlen(message->sender));
             }
         }
@@ -2210,8 +2244,8 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
     if (has_reply) {
         int reply_baseline;
 
-        reply_baseline = y + header_h + lh;
-        if (reply_baseline <= bottom && reply_baseline - lh >= top) {
+        reply_baseline = tg_gui_centred_baseline(backend, y + header_h, lh);
+        if (y + header_h >= top && y + header_h + lh <= bottom) {
             char line[TG_GUI_REPLY_MAX + 4];
 
             line[0] = '>';
@@ -2259,10 +2293,11 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
     style = 0;
     for (k = 0; k < line_count; ++k) {
         int baseline;
+        int line_top;
 
-        baseline = y + header_h + reply_h + photo_h + photo_gap +
-                   (k * lh) + lh;
-        if (baseline <= bottom && baseline - lh >= top) {
+        line_top = y + header_h + reply_h + photo_h + photo_gap + (k * lh);
+        baseline = tg_gui_centred_baseline(backend, line_top, lh);
+        if (line_top >= top && line_top + lh <= bottom) {
             /* Mouse selection: tint the selected char range of THIS visual
                line before the glyphs go down, so the text stays crisp on the
                SELECT band (same language as the selected sidebar row). */
@@ -2280,8 +2315,8 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
                     int sw = tg_gui_marked_width(backend, message->text,
                                                  (unsigned long)lo,
                                                  (unsigned long)hi);
-                    int sy = baseline - lh + 3;
-                    int sh = lh;
+                    int sy = line_top + 1;
+                    int sh = lh - 2;
 
                     if (sy < top) { /* clip to the transcript viewport */
                         sh -= top - sy;
@@ -2383,7 +2418,7 @@ static int tg_gui_input_text_w(const tg_gui_state *state, int width, int sidebar
     int w;
 
     w = (width - 64 - (state->emoji_enabled ? TG_GUI_EMOJI_BUTTON_W : 0)) -
-        (sidebar_w + 12) - 8;
+        (sidebar_w + 12 + TG_GUI_ATTACH_BUTTON_W) - 8;
     if (w < 20) {
         w = 20;
     }
@@ -2446,6 +2481,42 @@ int tg_gui_input_layout_height(const tg_gui_state *state,
 }
 
 /* --- Emoji picker --------------------------------------------------------- */
+
+/* A small monochrome paperclip, drawn with the current theme's pens. This
+   independent 16px outline needs no image datatype, file or palette. */
+static void tg_gui_paint_attach_button(tg_gui_backend *backend, int sidebar_w,
+                                       int box_top, int input_h)
+{
+    static const unsigned short rows[16] = {
+        0x0020U, 0x00f0U, 0x0198U, 0x038cU,
+        0x078cU, 0x0718U, 0x0f18U, 0x1e30U,
+        0x3c6cU, 0x38ccU, 0x3998U, 0x2fb0U,
+        0x3760U, 0x18c0U, 0x0fc0U, 0x0200U
+    };
+    int bx = sidebar_w + 8 + (TG_GUI_ATTACH_BUTTON_W - 16) / 2;
+    int by = box_top + (input_h - 4 - 16) / 2;
+    int y;
+
+    for (y = 0; y < 16; ++y) {
+        int x = 0;
+
+        while (x < 16) {
+            int start;
+
+            if ((rows[y] & (0x8000U >> x)) == 0U) {
+                ++x;
+                continue;
+            }
+            start = x++;
+            while (x < 16 && (rows[y] & (0x8000U >> x)) != 0U) {
+                ++x;
+            }
+            backend->fill_rect(backend, TG_GUI_PEN_TEXT_DIM,
+                               tg_gui_make_rect(bx + start, by + y,
+                                                x - start, 1));
+        }
+    }
+}
 
 /* The smiley button between the input and Send, in the spirit of the desktop
    client's toggle at the right end of the field: a sheet glyph in a square,
@@ -2959,7 +3030,7 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
     status_h = lh + 6;
     content_h = height - status_h;
     sidebar_w = tg_gui_sidebar_w(width);
-    area_x = sidebar_w + 12;
+    area_x = sidebar_w + 12 + TG_GUI_ATTACH_BUTTON_W;
     rows = tg_gui_input_rows(state, backend, width, sidebar_w);
     input_h = (rows * lh) + 14;
     box_top = content_h - input_h;
@@ -3010,6 +3081,7 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
     backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
                        tg_gui_make_rect(sidebar_w + 8, box_top,
                                         width - sidebar_w - 16, input_h - 4));
+    tg_gui_paint_attach_button(backend, sidebar_w, box_top, input_h);
     if (state->input[0] != '\0') {
         unsigned long starts[TG_GUI_WRAP_MAX_LINES];
         unsigned long lengths[TG_GUI_WRAP_MAX_LINES];
@@ -3244,18 +3316,21 @@ static void tg_gui_paint_main(const tg_gui_state *state,
             }
             text_x = area_x + av + 8;
         }
-        tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT, text_x, lh + 2,
+        tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT, text_x,
+                            tg_gui_centred_baseline(backend, 2, lh),
                             state->title, area_w - (text_x - area_x));
         /* While the peer is typing, the second header line shows "X is
            typing..." in the accent colour instead of the static subtitle
            (Telegram's cue). */
         if (state->typing[0] != '\0') {
             tg_gui_draw_clipped(backend, TG_GUI_PEN_ACCENT, text_x,
-                                header_h + lh - 2, state->typing,
+                                tg_gui_centred_baseline(backend, header_h - 2, lh),
+                                state->typing,
                                 area_w - (text_x - area_x));
         } else {
             tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT_DIM, text_x,
-                                header_h + lh - 2, state->subtitle,
+                                tg_gui_centred_baseline(backend, header_h - 2, lh),
+                                state->subtitle,
                                 area_w - (text_x - area_x));
         }
     }
@@ -3709,6 +3784,10 @@ int tg_gui_hit_test(const tg_gui_state *state, int width, int height, int lh,
             x >= width - 64 - TG_GUI_EMOJI_BUTTON_W && x < width - 64) {
             return TG_GUI_HIT_EMOJI_BUTTON;
         }
+        if (x >= sidebar_w + 8 &&
+            x < sidebar_w + 8 + TG_GUI_ATTACH_BUTTON_W) {
+            return TG_GUI_HIT_ATTACH_BUTTON;
+        }
         if (x >= width - 64) {
             return TG_GUI_HIT_SEND;
         }
@@ -4035,6 +4114,45 @@ static int tg_gui_context_items(const tg_gui_state *state, const char **labels,
     ids[n] = TG_GUI_CTX_SENDPHOTO;
     ++n;
     return n;
+}
+
+int tg_gui_attachment_is_photo(const char *path)
+{
+    const char *dot;
+    const char *p;
+    char ext[6];
+    int n;
+
+    if (path == 0) {
+        return 0;
+    }
+    dot = 0;
+    for (p = path; *p != '\0'; ++p) {
+        if (*p == '/' || *p == ':') {
+            dot = 0;
+        } else if (*p == '.') {
+            dot = p;
+        }
+    }
+    if (dot == 0) {
+        return 0;
+    }
+    n = 0;
+    while (dot[n] != '\0' && n < 5) {
+        char c;
+
+        c = dot[n];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+        ext[n++] = c;
+    }
+    ext[n] = '\0';
+    if (dot[n] != '\0') {
+        return 0;
+    }
+    return strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0 ||
+           strcmp(ext, ".png") == 0;
 }
 
 int tg_gui_photo_default_filename(char *out, unsigned long out_size,
@@ -4373,6 +4491,10 @@ void tg_gui_paint(const tg_gui_state *state, tg_gui_backend *backend)
 typedef struct tg_gui_record {
     int width;
     int height;
+    int line_h;
+    int ascent;
+    int first_text_x;
+    int first_text_y;
     int fills;
     int avatars;
     int photos;
@@ -4406,8 +4528,14 @@ static int tg_gui_rec_height(tg_gui_backend *backend)
 
 static int tg_gui_rec_line_height(tg_gui_backend *backend)
 {
-    (void)backend;
-    return 10;
+    int h = ((tg_gui_record *)backend->context)->line_h;
+
+    return h > 0 ? h : 10;
+}
+
+static int tg_gui_rec_ascent(tg_gui_backend *backend)
+{
+    return ((tg_gui_record *)backend->context)->ascent;
 }
 
 #define TG_GUI_REC_EMOJI_CELL 12
@@ -4527,6 +4655,10 @@ static void tg_gui_rec_text(tg_gui_backend *backend, int pen, int x,
 
     (void)pen;
     record = (tg_gui_record *)backend->context;
+    if (record->texts == 0) {
+        record->first_text_x = x;
+        record->first_text_y = baseline;
+    }
     record->texts += 1;
     /* The read receipt is no longer text -- it is drawn as ticks in the READ pen
        and counted in tg_gui_rec_fill. */
@@ -5196,8 +5328,8 @@ int tg_gui_self_test(void)
             }
             tg_gui_set_emoji_enabled(&state, 1);
             for (h = 8; h <= 24; ++h) {
-                if (tg_gui_emoji_inline_size(&state, h) != (h < 12 ? 0 : h)) {
-                    puts("gui self-test: enabled emoji font fallback mismatch");
+                if (tg_gui_emoji_inline_size(&state, h) != (h < 16 ? 16 : h)) {
+                    puts("gui self-test: enabled emoji is unreadable on small font");
                     return 2;
                 }
             }
@@ -5237,6 +5369,117 @@ int tg_gui_self_test(void)
                 puts("gui self-test: sticker marker fell back to [Photo]");
                 return 2;
             }
+        }
+    }
+
+    /* A small native font stays at its original size, centred in a readable
+       emoji cell. Row spacing must contain it; OFF restores compact metrics. */
+    {
+        static const int metrics[][5] = {
+            /* font height/baseline, line height, cell ascent, emoji square */
+            {8, 6, 18, 10, 16},
+            {9, 6, 18, 9, 16},
+            {12, 9, 18, 11, 16},
+            {16, 11, 18, 11, 16},
+            {24, 18, 26, 18, 24}
+        };
+        static tg_gui_state draft;
+        unsigned long i;
+        int enabled;
+
+        tg_gui_demo_state(&draft);
+        for (i = 0; i < sizeof(metrics) / sizeof(metrics[0]); ++i) {
+            const int *m = metrics[i];
+
+            draft.emoji_enabled = 1;
+            if (tg_gui_font_line_height(&draft, m[0]) != m[2] ||
+                tg_gui_font_cell_ascent(&draft, m[0], m[1]) != m[3] ||
+                tg_gui_emoji_inline_size(&draft, m[0]) != m[4]) {
+                puts("gui self-test: emoji line metrics do not fit the glyph");
+                return 2;
+            }
+            draft.emoji_enabled = 0;
+            if (tg_gui_font_line_height(&draft, m[0]) != m[0] + 2 ||
+                tg_gui_font_cell_ascent(&draft, m[0], m[1]) != m[1]) {
+                puts("gui self-test: disabled emoji did not restore font metrics");
+                return 2;
+            }
+        }
+        for (enabled = 0; enabled <= 1; ++enabled) {
+            tg_gui_record rec;
+            tg_gui_backend b = backend;
+            int sw = tg_gui_sidebar_w(1280);
+            int y;
+
+            memset(&rec, 0, sizeof(rec));
+            rec.width = 1280;
+            rec.height = 720;
+            draft.emoji_enabled = enabled;
+            rec.line_h = tg_gui_font_line_height(&draft, 8);
+            rec.ascent = tg_gui_font_cell_ascent(&draft, 8, 6);
+            b.context = &rec;
+            b.font_ascent = tg_gui_rec_ascent;
+            strcpy(draft.input, "abc");
+            draft.input_caret = 2;
+            draft.composing = 1;
+            tg_gui_paint_input_row(&draft, &b);
+            y = rec.first_text_y;
+            if (rec.first_text_x != sw + 34 ||
+                tg_gui_input_click_caret(&draft, &b, rec.first_text_x + 6, y) != 1 ||
+                tg_gui_hit_test(&draft, 1280, 720, rec.line_h,
+                                 sw + 18, y) != TG_GUI_HIT_ATTACH_BUTTON ||
+                tg_gui_hit_test(&draft, 1280, 720, rec.line_h,
+                                 rec.first_text_x, y) != TG_GUI_HIT_INPUT) {
+                puts("gui self-test: paperclip overlaps input or shifts caret clicks");
+                return 2;
+            }
+            if (enabled) {
+                char pair[2];
+                int glyph_bottom;
+
+                /* Clicking the last pixel of the first line's tall emoji
+                   must stay on that line, not select the next wrapped row. */
+                memset(&draft.messages[0], 0, sizeof(draft.messages[0]));
+                draft.messages[0].is_own = 1;
+                (void)tg_gui_emoji_encode(0UL, pair);
+                strcpy(draft.messages[0].text, "aXXb\nabc");
+                draft.messages[0].text[1] = pair[0];
+                draft.messages[0].text[2] = pair[1];
+                draft.message_count = draft.msg_cached = 1;
+                draft.msg_top[0] = 10;
+                draft.tr_area_x = 10;
+                draft.tr_area_w = 480;
+                rec.texts = 0;
+                (void)tg_gui_paint_bubble(&b, &draft.messages[0], 10, 480,
+                                          10, rec.line_h, 0, 200, 0, 0, 1, 0, 0);
+                glyph_bottom = rec.first_text_y - rec.ascent + 15;
+                if (tg_gui_transcript_char_at(&draft, &b, rec.line_h, 0,
+                                               rec.first_text_x + 6,
+                                               glyph_bottom) != 1) {
+                    puts("gui self-test: tall emoji click leaked into next chat row");
+                    return 2;
+                }
+                memcpy(draft.messages[0].reply_text, pair, 2);
+                draft.messages[0].reply_text[2] = '\0';
+                rec.texts = 0;
+                (void)tg_gui_paint_bubble(&b, &draft.messages[0], 10, 480,
+                                          10, rec.line_h, 0, 200, 0, 0, 1, 0, 0);
+                if (rec.first_text_y - rec.ascent < 10 ||
+                    rec.first_text_y - rec.ascent + 16 > 10 + rec.line_h) {
+                    puts("gui self-test: tall reply emoji overlaps the message body");
+                    return 2;
+                }
+            }
+        }
+        if (!tg_gui_attachment_is_photo("Work:photo.PNG") ||
+            !tg_gui_attachment_is_photo("Work:photo.JpEg") ||
+            !tg_gui_attachment_is_photo("Work:photo.jpg") ||
+            tg_gui_attachment_is_photo("Work:photo.jpeg.backup") ||
+            tg_gui_attachment_is_photo("Work:images.png/readme") ||
+            tg_gui_attachment_is_photo("Work:archive.lha") ||
+            tg_gui_attachment_is_photo(0)) {
+            puts("gui self-test: attachment photo/file choice mismatch");
+            return 2;
         }
     }
 

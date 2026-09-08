@@ -45,7 +45,9 @@ editing, read receipts and avatars delivered by earlier releases.
 Development on `main` now targets 0.0.93, the sending cycle: the emoji
 picker and images that are not JPEGs. Emoji and inline photos have separate
 saved settings; both default off on native AGA/ECS/OCS screens (including
-classic OS4) or 68k CPUs below 68040. Work there is unreleased and remains
+classic OS4) or 68k CPUs below 68040. Enabled emoji stay graphical with small
+fonts, and a paperclip in the composer opens the attachment chooser.
+Work there is unreleased and remains
 subject to real-system validation on all five platforms; see
 [ROADMAP.md](ROADMAP.md).
 

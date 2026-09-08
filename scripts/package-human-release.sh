@@ -508,8 +508,9 @@ Using the GUI
   graphical emoji in messages. Off closes the picker, restores text emoticons
   and keeps any emoji already entered in the composer. Its choice is saved
   independently of photos. It defaults off on AGA/ECS/OCS screens (including
-  classic OS4) or 68k CPUs below 68040; a manual choice overrides it. Even
-  when enabled, fonts below 12 pixels keep text emoticons for readability.
+  classic OS4) or 68k CPUs below 68040; a manual choice overrides it. When
+  enabled, emoji are at least 16 pixels, including with Topaz 8 on OS3. The
+  font stays unchanged and the rows make room; Off restores compact text rows.
 - Videos show a frame and a pasted link shows its preview, with the picture
   when the page has one. Both go through the same photo pipeline, so the same
   "Show inline photos" setting governs them. Stickers show the emoji they
@@ -531,6 +532,9 @@ Using the GUI
   are checked before anything is uploaded. A photo over 10 MiB is preserved
   and sent as a document instead. Telegram can re-encode photos as JPEG;
   choose File, then Download, to preserve an original PNG unchanged.
+- The paperclip at the left of the composer opens the attachment chooser.
+  JPEG/PNG attachments offer Photo, File or Cancel with a caption; other files
+  use normal file upload. The button also works with emoji and photos disabled.
 - "Insert emoji..." in the Telegram menu (Amiga+E), or the smiley button next
   to Send, opens a panel above the composer: the recent ones first, then the
   whole set. Arrow keys move, ENTER
@@ -698,9 +702,10 @@ Usare la GUI
   le emoji grafiche nei messaggi. Off chiude il pannello, mostra emoticon
   testuali e conserva le emoji gia' inserite nel composer. La scelta viene
   salvata separatamente dalle foto. Parte spento su schermi AGA/ECS/OCS
-  (anche OS4 classic) oppure con CPU 68k sotto il 68040; una scelta manuale sostituisce
-  il default. Anche quando attivo, con font sotto 12 pixel restano le emoticon
-  testuali per leggibilita'.
+  (anche OS4 classic) oppure con CPU 68k sotto il 68040; una scelta manuale
+  sostituisce il default. Quando attivo le emoji sono di almeno 16 pixel,
+  anche con Topaz 8 su OS3: il font resta uguale e le righe fanno spazio.
+  Off ripristina le righe compatte con emoticon testuali.
 - I video mostrano un fotogramma e un link incollato mostra la sua anteprima,
   con l'immagine se la pagina ne ha una. Passano dalla stessa pipeline delle
   foto, quindi li governa la stessa impostazione "Show inline photos". Gli
@@ -723,6 +728,9 @@ Usare la GUI
   massimo 10000, al massimo 20:1) sono controllati prima di caricare. Oltre
   10 MiB viene inviato come file. Telegram puo' ricodificare le foto in JPEG;
   scegli File e poi Download per conservare una PNG originale senza modifiche.
+- La graffetta a sinistra del composer apre il selettore degli allegati.
+  JPEG e PNG offrono Photo, File o Cancel con didascalia; gli altri file
+  seguono l'invio normale. Funziona anche con emoji e foto disabilitate.
 - "Insert emoji..." nel menu Telegram (Amiga+E), o la faccina accanto a
   Send, apre un pannello sopra il composer: prima le emoji recenti, poi tutte. Le frecce si muovono, ENTER
   inserisce e lascia il pannello aperto, ESC lo chiude; anche un click

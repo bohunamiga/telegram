@@ -628,15 +628,18 @@ check mark) remain text only.
 The hard half followed at once, because the machinery made it cheap:
 received emoji are pairs too, emitted by the display conversion for any
 codepoint the sheet knows, and the backends draw them inside the text
-runs. Field feedback set the one rule that matters on this hardware:
-below a twelve pixel cell a reduced picture is a blob, so there the text
-emoticon stands in (Topaz 8 lands at nine), while the panel keeps its
-pictures at sixteen pixels regardless of the font. "Settings > Enable emoji"
+runs. With emoji enabled the cell is now at least sixteen pixels, even on
+OS3 with Topaz 8: the font stays unchanged, and the line metrics reserve room
+for the glyph and centre the smaller letters beside it. Resolution does not
+decide whether an emoji becomes a picture. "Settings > Enable emoji"
 turns off the picker, its composer button and graphical text rendering,
 leaving text emoticons and any already-entered emoji intact. Its saved choice
 is independent of photos. Both features default off on native AGA/ECS/OCS
 screens (including classic OS4) or 68k CPUs below 68040, with explicit choices taking
 precedence. The screen's bitmap determines RTG, not an installed library.
+A monochrome paperclip at the composer's left opens an unfiltered attachment
+requester. JPEG/PNG names lead to the Photo/File/Cancel dialog; other files
+use the normal upload path. The paperclip stays usable with graphics off.
 Still owed: a hardware pass on every lane, the AfA_OS one in particular, before
 anyone calls the transcript rendering done.
 

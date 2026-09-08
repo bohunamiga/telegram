@@ -594,9 +594,8 @@ static int tg_gui_amiga_line_height(tg_gui_backend *backend)
     return ((tg_gui_amiga_ctx *)backend->context)->line_h;
 }
 
-/* Baseline to top of the glyph cell, straight from the RastPort's font, so the
-   caret covers the letters instead of floating above them on systems whose
-   default font is taller than topaz 8. */
+/* The font stays native; its baseline is centred in a taller layout cell
+   when small-font text shares a line with a graphical emoji. */
 static int tg_gui_amiga_font_ascent(tg_gui_backend *backend)
 {
     const tg_gui_amiga_ctx *ctx = (const tg_gui_amiga_ctx *)backend->context;
@@ -604,7 +603,9 @@ static int tg_gui_amiga_font_ascent(tg_gui_backend *backend)
     if (ctx == 0 || ctx->rport == 0 || ctx->rport->Font == 0) {
         return 0; /* renderer falls back to its own approximation */
     }
-    return (int)ctx->rport->Font->tf_Baseline;
+    return tg_gui_font_cell_ascent(ctx->state,
+                                   (int)ctx->rport->Font->tf_YSize,
+                                   (int)ctx->rport->Font->tf_Baseline);
 }
 
 static unsigned long tg_gui_amiga_font_char_index(const struct TextFont *font,
@@ -669,8 +670,8 @@ static int tg_gui_amiga_run_width(tg_gui_amiga_ctx *ctx, const char *text,
     return (int)TextLength(ctx->rport, (STRPTR)text, (UWORD)length);
 }
 
-/* The same size decision drives width and paint. Zero selects text emoticons
-   when emoji are disabled or the font is too small for a readable picture. */
+/* Width, paint and line metrics share a minimum readable emoji cell. Zero
+   selects text emoticons only when the feature is disabled. */
 static int tg_gui_amiga_emoji_cell(const tg_gui_amiga_ctx *ctx)
 {
     int h = ctx->rport != 0 && ctx->rport->Font != 0
@@ -4281,10 +4282,9 @@ static void tg_gui_amiga_draw_text(tg_gui_backend *backend, int pen, int x,
                                   i - run_start);
             x += tg_gui_amiga_run_width(ctx, text + run_start, i - run_start);
             if (cell > 0) {
-                ascent = ctx->rport != 0 && ctx->rport->Font != 0
-                             ? (int)ctx->rport->Font->tf_Baseline : cell - 2;
+                ascent = tg_gui_amiga_font_ascent(backend);
                 tg_gui_amiga_glyph_image(backend, index, x,
-                                         baseline - ascent - (cell - ascent - 1) / 2,
+                                         baseline - ascent,
                                          cell);
                 x += cell;
             } else {
@@ -6650,42 +6650,6 @@ static void tg_gui_photo_save_cancel(tg_gui_state *state,
     tg_gui_photo_save_status(state, backend, "Photo save cancelled");
 }
 
-static int tg_gui_window_path_is_jpeg(const char *path)
-{
-    const char *dot;
-    const char *p;
-    char ext[6];
-    int n;
-
-    if (path == 0) {
-        return 0;
-    }
-    dot = 0;
-    for (p = path; *p != '\0'; ++p) {
-        if (*p == '/' || *p == ':') {
-            dot = 0;
-        } else if (*p == '.') {
-            dot = p;
-        }
-    }
-    if (dot == 0) {
-        return 0;
-    }
-    n = 0;
-    while (dot[n] != '\0' && n < 5) {
-        char c;
-
-        c = dot[n];
-        if (c >= 'A' && c <= 'Z') {
-            c = (char)(c - 'A' + 'a');
-        }
-        ext[n++] = c;
-    }
-    ext[n] = '\0';
-    return strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0 ||
-           strcmp(ext, ".png") == 0;
-}
-
 /* ASL file requester -> non-blocking upload on the open chat.
    The requester is synchronous and system-rendered (safe while we are the
    caller); the upload is only ARMED here -- the event loop pumps it one part
@@ -6693,11 +6657,12 @@ static int tg_gui_window_path_is_jpeg(const char *path)
 static void tg_gui_window_send_file_mode(tg_gui_state *state,
                                          struct Window *win,
                                          tg_gui_backend *backend,
-                                         int as_photo)
+                                         int mode) /* 0 file, 1 photo, 2 paperclip */
 {
     struct FileRequester *req;
     char path[256];
     int rc;
+    int as_photo = mode == 1;
 
     if (state->mode != TG_GUI_MODE_CHAT || !tg_gui_session_is_open() ||
         state->chat_count <= 0) {
@@ -6736,7 +6701,8 @@ static void tg_gui_window_send_file_mode(tg_gui_state *state,
     } else {
         req = (struct FileRequester *)AllocAslRequestTags(
             ASL_FileRequest, ASLFR_Window, (unsigned long)win,
-            ASLFR_TitleText, (unsigned long)"Send file to this chat",
+            ASLFR_TitleText, TG_GUI_TAG(mode == 2 ? "Attach to this chat"
+                                                   : "Send file to this chat"),
             TAG_DONE);
     }
     path[0] = '\0';
@@ -6770,6 +6736,9 @@ static void tg_gui_window_send_file_mode(tg_gui_state *state,
     AslBase = 0;
     if (path[0] == '\0') {
         return; /* cancelled */
+    }
+    if (mode == 2) {
+        as_photo = tg_gui_attachment_is_photo(path);
     }
     if (as_photo) {
         char dcaption[512];
@@ -8315,7 +8284,8 @@ static int tg_gui_run_window_once(tg_gui_state *state)
         SetFont(ctx.rport, own_scr->RastPort.Font);
     }
     font = ctx.rport->Font;
-    ctx.line_h = (font != 0 ? (int)font->tf_YSize : 8) + 2;
+    ctx.line_h = tg_gui_font_line_height(state,
+                                         font != 0 ? (int)font->tf_YSize : 8);
     ctx.bitmap_text_compat = tg_gui_amiga_afa_text_compat();
     if (ctx.bitmap_text_compat) {
         tg_gui_log("window: AfA bitmap-text compatibility active");
@@ -9617,6 +9587,10 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                                                             &backend);
                         } else if (ud == (APTR)TG_MENU_ENABLEEMOJI) {
                             tg_gui_set_emoji_enabled(state, !state->emoji_enabled);
+                            ctx.line_h = tg_gui_font_line_height(
+                                state, ctx.rport->Font != 0
+                                           ? (int)ctx.rport->Font->tf_YSize : 8);
+                            viewer.ctx.line_h = ctx.line_h;
                             if (menu != 0) {
                                 ClearMenuStrip(ctx.window);
                                 tg_gui_menu_set_emoji(menu, state->emoji_enabled);
@@ -10409,6 +10383,13 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                         caret_ticks = 0;
                         tg_gui_window_paint(state, &backend);
                         continue;
+                    } else if (hit == TG_GUI_HIT_ATTACH_BUTTON) {
+                        tg_gui_emoji_close(state);
+                        state->mention_active = 0;
+                        tg_gui_window_send_file_mode(state, ctx.window,
+                                                      &backend, 2);
+                        tg_gui_window_paint(state, &backend);
+                        continue;
                     } else if (state->emoji_active &&
                                hit != TG_GUI_HIT_INPUT) {
                         /* Any other press puts the panel away and then acts
@@ -10856,7 +10837,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                             dname = dp + 1;
                         }
                     }
-                    if (tg_gui_window_path_is_jpeg(dropped)) {
+                    if (tg_gui_attachment_is_photo(dropped)) {
                         char dropcap[512];
 
                         jpeg_mode = tg_gui_window_send_photo_dialog(

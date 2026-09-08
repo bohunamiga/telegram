@@ -83,11 +83,9 @@ struct tg_gui_backend {
     /* Apply a TG_GUI_STYLE_* bitmask to subsequent draw_text calls. NULL on
        backends that render plain (the renderer then just skips the markers). */
     void (*set_style)(tg_gui_backend *backend, int style);
-    /* OPTIONAL: distance from a draw_text baseline to the top of the glyph
-       cell (the font's ascent). Text is placed by baseline, so anything that
-       has to line up WITH the glyphs -- the caret -- needs this instead of
-       guessing from line_height, whose leading and descender depth vary with
-       the font. NULL falls back to the old approximation. */
+    /* OPTIONAL: baseline to top of the layout cell. A small font may sit
+       centred inside a taller emoji cell; caret/selection use that same cell.
+       NULL falls back to the old approximation. */
     int (*font_ascent)(tg_gui_backend *backend);
     /* OPTIONAL: draw the peer's real avatar (decoded stripped thumb) into rect.
        Returns 1 when it drew, 0 to make the renderer fall back to the classic
@@ -481,6 +479,7 @@ int tg_gui_input_layout_height(const tg_gui_state *state,
 #define TG_GUI_HIT_REPLY_CANCEL (-6) /* the "Replying to ..." composer header */
 /* The smiley button in the composer row that toggles the emoji picker. */
 #define TG_GUI_HIT_EMOJI_BUTTON (-7)
+#define TG_GUI_HIT_ATTACH_BUTTON (-8) /* paperclip opens the attachment picker */
 /* Emoji picker cells: TG_GUI_HIT_EMOJI_BASE + cell. Positive on purpose: the
    message and photo ranges are negative and their dispatch tests "<=". */
 #define TG_GUI_HIT_EMOJI_BASE 1000
@@ -518,8 +517,12 @@ void tg_gui_emoji_preferences_load(const char *path, int *enabled,
                                    int *explicit_choice);
 int tg_gui_emoji_preferences_save(const char *path, int enabled);
 void tg_gui_set_emoji_enabled(tg_gui_state *state, int enabled);
-/* Zero means text emoticons; otherwise the square used by width AND paint. */
+/* Zero means emoji disabled; otherwise a square of at least 16px. Line
+   height and ascent reserve that cell while keeping the actual font intact. */
 int tg_gui_emoji_inline_size(const tg_gui_state *state, int font_height);
+int tg_gui_font_line_height(const tg_gui_state *state, int font_height);
+int tg_gui_font_cell_ascent(const tg_gui_state *state, int font_height,
+                            int font_baseline);
 /* Compatibility wrappers for callers interested only in the first line. */
 int tg_gui_inline_photos_load(const char *path);
 int tg_gui_inline_photos_save(const char *path, int enabled);
@@ -584,6 +587,9 @@ int tg_gui_context_menu_measure(const tg_gui_state *state,
    message action. TG_MENU_DLDIR carries that separate command. */
 #define TG_GUI_CTX_ITEMS_MAX 10
 
+/* Attachment chooser: known image extensions get the Photo/File dialog;
+   validation of the actual bytes still belongs to the upload gate. */
+int tg_gui_attachment_is_photo(const char *path);
 /* Save-as helpers shared by the native requester and host self-test. The
    suggested extension follows the cached file's JPEG/PNG signature. */
 int tg_gui_photo_default_filename(char *out, unsigned long out_size,

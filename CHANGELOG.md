@@ -8,6 +8,10 @@ unless noted.
 ## [Unreleased]
 
 ### Added
+- A paperclip at the left of the composer opens the attachment requester.
+  JPEG and PNG attachments offer Photo, File or Cancel, with the existing
+  caption dialog; other attachments follow the file upload path. It remains
+  available when emoji and inline photos are disabled.
 - "Settings > Enable emoji" switches the picker, composer button and graphical
   emoji on or off. With it off, messages keep their text emoticons and the
   composer keeps any emoji already entered. The choice is saved separately
@@ -24,17 +28,17 @@ unless noted.
   this client already reads back as text emoticons, in a grid walked with the
   arrow keys or clicked. ENTER inserts one at the caret and keeps the panel
   open, ESC closes it, and the recent row survives between runs. Inside the
-  composer an emoji is drawn as a small picture the height of the text, is
+  composer an emoji is drawn as a picture at least 16 pixels high, is
   edited and stepped over as one character, and goes out as its real Unicode
   codepoint. The pictures are Noto Emoji glyphs reduced to 16 pixels, shipped
   under the SIL Open Font License; see third_party/noto-emoji. A smiley
   button between the input and Send opens the same panel with the mouse,
   centred vertically on the visible input box even with a small font.
-- Received emoji show as pictures too, the same ones the picker offers, so a
-  face someone sends and the one you answer with look alike. Where the font
-  is too small for a readable picture (Topaz 8 gives nine pixels of cell) the
-  text emoticon stands in, on screen and in the clipboard; the panel keeps
-  its pictures at their native size everywhere.
+- Received emoji show as pictures too, the same ones the picker offers. Small
+  OS3 fonts such as Topaz 8 keep their size while the layout reserves a cell
+  of at least 16 pixels for a readable emoji, with matching row spacing and
+  caret positioning. Turning emoji off restores compact text rows and text
+  emoticons. Clipboard text keeps the emoticon representation.
 - A PNG goes out as a photo. The photo gate now reads the file's own bytes
   rather than its name: a JPEG is walked through its first scan as before, a
   PNG through its chunks to IEND, so a truncated file of either kind is
