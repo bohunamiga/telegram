@@ -8,6 +8,12 @@ unless noted.
 ## [Unreleased]
 
 ### Added
+- "Settings > Enable emoji" switches the picker, composer button and graphical
+  emoji on or off. With it off, messages keep their text emoticons and the
+  composer keeps any emoji already entered. The choice is saved separately
+  from photos. Like inline photos, emoji start off on native AGA/ECS/OCS
+  screens or a 68k CPU below 68040; both need a 68040 or faster and an
+  RTG screen to start on. Explicit on/off choices override the defaults.
 - A link preview that Telegram finishes later appears in the open chat by
   itself, including on a link just sent from this client. The title and
   description update the existing message; its picture uses the same Inline
@@ -37,6 +43,18 @@ unless noted.
   for the same reason, and the server's own refusals now come back in words
   instead of an RPC name. The menu requester, the drop target and the text
   client's /photo all take .png alongside .jpg.
+
+### Fixed
+- Composer text, caret and selection use the font's real baseline, correcting
+  the low text position with taller MorphOS fonts. The Send label stays
+  centred when the composer wraps onto several lines.
+- "Save photo as..." suggests .png for PNG bytes and .jpg for JPEG bytes,
+  regardless of the internal cache name. An uncached image is fetched before
+  the requester opens, then copied without conversion. Photos re-encoded by
+  Telegram keep the received format; sending as File preserves the original.
+- The automatic inline-photo default checks the screen's actual bitmap.
+  Having cybergraphics.library installed no longer makes an AGA/ECS/OCS
+  screen count as RTG. Emoji use the same check, including on classic OS4.
 
 ## [0.0.92] - 2026-09-04
 

@@ -306,11 +306,8 @@ is the worst moment to add a path that installs code.
 
 ## Planned: send other image formats, PNG first
 
-Only a JPEG can be sent as a photo today. The GUI decides from the file
-extension, and the upload path then checks the magic bytes and the SOF
-segment, refusing anything else with "not a valid JPEG"; every other
-image still goes out as a document, which works but arrives as a file
-rather than a picture.
+JPEG and PNG can be sent as photos in the 0.0.93 candidate. Other image
+formats still go out as documents; IFF conversion remains planned below.
 
 The upload itself is format agnostic, it is bytes plus
 `inputMediaUploadedPhoto`, so the work splits in two very different
@@ -325,6 +322,11 @@ Telegram's own limits from the header (width plus height at most 10000,
 at most 20 to 1, verified at core.telegram.org), and turns the server's
 refusals (`PHOTO_INVALID_DIMENSIONS`, `PHOTO_EXT_INVALID`,
 `IMAGE_PROCESS_FAILED`) into sentences.
+
+The photo size limit stays at 10 MiB; larger originals go as documents.
+"Save photo as..." follows the received JPEG/PNG signature and copies the
+bytes unchanged. A photo re-encoded by Telegram cannot supply the original
+PNG; sending it as File and using Download preserves that original instead.
 
 IFF ILBM is the interesting half, and the one that matters on this
 platform: it is what an Amiga actually produces, and Telegram will
@@ -629,8 +631,13 @@ codepoint the sheet knows, and the backends draw them inside the text
 runs. Field feedback set the one rule that matters on this hardware:
 below a twelve pixel cell a reduced picture is a blob, so there the text
 emoticon stands in (Topaz 8 lands at nine), while the panel keeps its
-pictures at sixteen pixels regardless of the font. Still owed: a
-hardware pass on every lane, the AfA_OS one in particular, before
+pictures at sixteen pixels regardless of the font. "Settings > Enable emoji"
+turns off the picker, its composer button and graphical text rendering,
+leaving text emoticons and any already-entered emoji intact. Its saved choice
+is independent of photos. Both features default off on native AGA/ECS/OCS
+screens (including classic OS4) or 68k CPUs below 68040, with explicit choices taking
+precedence. The screen's bitmap determines RTG, not an installed library.
+Still owed: a hardware pass on every lane, the AfA_OS one in particular, before
 anyone calls the transcript rendering done.
 
 On borrowing: the desktop client is worth studying for how a feature

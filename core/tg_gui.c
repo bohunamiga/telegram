@@ -13,6 +13,7 @@
 #include "tg_emoji_sheet.h"
 
 #define TG_GUI_EMOJI_BUTTON_W 22 /* smiley button in the composer row */
+#define TG_GUI_INPUT_TEXT_PAD 6 /* equal air above and below the glyph block */
 #include "tg_gui_session.h" /* tg_gui_log: crash-safe first-paint trail */
 
 #include <stdio.h>
@@ -243,17 +244,102 @@ int tg_gui_inline_photos_save(const char *path, int enabled)
                                          cache_limit);
 }
 
-int tg_gui_inline_photos_resolve(int explicit_choice, int explicit_value,
-                                 int classic_os3, int cpu_at_least_040,
-                                 int has_rtg)
+int tg_gui_graphics_resolve(int explicit_choice, int explicit_value,
+                            int classic_amiga, int cpu_at_least_040, int has_rtg)
 {
     if (explicit_choice) {
         return explicit_value ? 1 : 0;
     }
-    if (classic_os3 && (!cpu_at_least_040 || !has_rtg)) {
+    if (classic_amiga && (!cpu_at_least_040 || !has_rtg)) {
         return 0;
     }
     return 1;
+}
+
+void tg_gui_graphics_preferences_resolve(tg_gui_state *state, int classic_amiga,
+                                        int cpu_at_least_040, int has_rtg)
+{
+    if (state == 0) {
+        return;
+    }
+    if (!state->inline_photos_default_resolved) {
+        state->inline_photos = tg_gui_graphics_resolve(
+            state->inline_photos_explicit, state->inline_photos,
+            classic_amiga, cpu_at_least_040, has_rtg);
+        state->inline_photos_default_resolved = 1;
+    }
+    if (!state->emoji_default_resolved) {
+        state->emoji_enabled = tg_gui_graphics_resolve(
+            state->emoji_explicit, state->emoji_enabled,
+            classic_amiga, cpu_at_least_040, has_rtg);
+        state->emoji_default_resolved = 1;
+    }
+    if (!state->emoji_enabled) {
+        tg_gui_emoji_close(state);
+    }
+}
+
+void tg_gui_emoji_preferences_load(const char *path, int *enabled,
+                                   int *explicit_choice)
+{
+    /* The same on/off/auto first line, in a separate preference file. */
+    tg_gui_photo_preferences_load(path, enabled, explicit_choice, 0, 0);
+}
+
+int tg_gui_emoji_preferences_save(const char *path, int enabled)
+{
+    FILE *file;
+    char tmp[288];
+    unsigned long length;
+    int failed;
+
+    if (path == 0 || path[0] == '\0') {
+        return 1;
+    }
+    length = (unsigned long)strlen(path);
+    if (length + 5UL >= sizeof(tmp)) {
+        return 1;
+    }
+    memcpy(tmp, path, length);
+    memcpy(tmp + length, ".tmp", 5UL);
+    file = fopen(tmp, "wb");
+    if (file == 0) {
+        return 1;
+    }
+    failed = fputs(enabled ? "on\n" : "off\n", file) == EOF;
+    if (fclose(file) != 0) {
+        failed = 1;
+    }
+    if (failed) {
+        (void)remove(tmp);
+        return 1;
+    }
+    (void)remove(path);
+    if (rename(tmp, path) != 0) {
+        (void)remove(tmp);
+        return 1;
+    }
+    return 0;
+}
+
+void tg_gui_set_emoji_enabled(tg_gui_state *state, int enabled)
+{
+    if (state == 0) {
+        return;
+    }
+    state->emoji_enabled = enabled ? 1 : 0;
+    state->emoji_explicit = 1;
+    state->emoji_default_resolved = 1;
+    if (!state->emoji_enabled) {
+        tg_gui_emoji_close(state);
+    }
+}
+
+int tg_gui_emoji_inline_size(const tg_gui_state *state, int font_height)
+{
+    /* A 16px picture reduced below 12px is not readable on small fonts. */
+    return state != 0 && state->emoji_enabled && font_height >= 12
+               ? font_height : 0;
 }
 
 static int tg_gui_photo_cache_older(const tg_gui_photo_cache_item *a,
@@ -584,6 +670,7 @@ void tg_gui_demo_state(tg_gui_state *state)
     memset(state, 0, sizeof(*state));
     state->theme = TG_GUI_THEME_DARK;
     state->inline_photos = 1;
+    state->emoji_enabled = 1;
     state->photo_dither = TG_GUI_PHOTO_DITHER_FULL;
     state->photo_cache_limit_mb = TG_GUI_PHOTO_CACHE_DEFAULT_MB;
 
@@ -786,7 +873,8 @@ int tg_gui_composer_insert_emoji(tg_gui_state *state, unsigned long index)
     unsigned long n;
     unsigned long c;
 
-    if (state == 0 || !tg_gui_emoji_encode(index, pair)) {
+    if (state == 0 || !state->emoji_enabled ||
+        !tg_gui_emoji_encode(index, pair)) {
         return 0;
     }
     n = (unsigned long)strlen(state->input);
@@ -1024,7 +1112,7 @@ static void tg_gui_paint_scrollbar(tg_gui_backend *backend, int x, int track_y,
 /* The sidebar search box (top strip): its own background + the query/placeholder
    + a caret that blinks when focused. Standalone so the caret blink can repaint
    just this strip (via tg_gui_paint_caret) instead of the whole window. */
-static int tg_gui_input_text_w(int width, int sidebar_w);
+static int tg_gui_input_text_w(const tg_gui_state *state, int width, int sidebar_w);
 static int tg_gui_input_rows(const tg_gui_state *state, tg_gui_backend *backend,
                              int width, int sidebar_w);
 
@@ -1185,13 +1273,13 @@ int tg_gui_input_click_caret(const tg_gui_state *state,
         return 0; /* empty input: anywhere in the box is offset 0 */
     }
     n = tg_gui_wrap(backend, state->input,
-                    tg_gui_input_text_w(width, sidebar_w), starts, lengths,
+                    tg_gui_input_text_w(state, width, sidebar_w), starts, lengths,
                     TG_GUI_WRAP_MAX_LINES);
     if (n < 1) {
         n = 1;
     }
     first = (n > rows) ? (n - rows) : 0;
-    line = first + ((y - (box_top + 2)) / lh);
+    line = first + ((y - (box_top + TG_GUI_INPUT_TEXT_PAD)) / lh);
     if (line < first) {
         line = first;
     }
@@ -2290,11 +2378,12 @@ static int tg_gui_message_height(tg_gui_backend *backend,
 
 /* Width available for the typed text: from the text origin to just before the
    Send button at width-64. */
-static int tg_gui_input_text_w(int width, int sidebar_w)
+static int tg_gui_input_text_w(const tg_gui_state *state, int width, int sidebar_w)
 {
     int w;
 
-    w = (width - 64 - TG_GUI_EMOJI_BUTTON_W) - (sidebar_w + 12) - 8;
+    w = (width - 64 - (state->emoji_enabled ? TG_GUI_EMOJI_BUTTON_W : 0)) -
+        (sidebar_w + 12) - 8;
     if (w < 20) {
         w = 20;
     }
@@ -2313,7 +2402,7 @@ static int tg_gui_input_rows(const tg_gui_state *state, tg_gui_backend *backend,
         return 1;
     }
     n = tg_gui_wrap(backend, state->input,
-                    tg_gui_input_text_w(width, sidebar_w), starts, lengths,
+                    tg_gui_input_text_w(state, width, sidebar_w), starts, lengths,
                     TG_GUI_WRAP_MAX_LINES);
     if (n < 1) {
         n = 1;
@@ -2484,8 +2573,11 @@ int tg_gui_emoji_geom_y; /* panel top as painted; the self-test reads it */
 
 void tg_gui_emoji_open(tg_gui_state *state)
 {
-    if (state == 0) {
+    if (state == 0 || !state->emoji_enabled) {
         return;
+    }
+    if (state->emoji_recent_count == 0) {
+        tg_gui_emoji_recent_load(state);
     }
     state->emoji_active = 1;
     state->emoji_sel = 0;
@@ -2508,7 +2600,7 @@ void tg_gui_emoji_move(tg_gui_state *state, int dx, int dy)
     int col;
     int target;
 
-    if (state == 0 || !state->emoji_active) {
+    if (state == 0 || !state->emoji_enabled || !state->emoji_active) {
         return;
     }
     /* Geometry for a nominal window: only cols matters for movement, and
@@ -2576,7 +2668,7 @@ int tg_gui_emoji_pick(tg_gui_state *state)
     unsigned long glyph;
     int from_recents;
 
-    if (state == 0 || !state->emoji_active) {
+    if (state == 0 || !state->emoji_enabled || !state->emoji_active) {
         return 0;
     }
     tg_gui_emoji_geometry(state, tg_gui_emoji_geom_w > 0 ? tg_gui_emoji_geom_w : 640,
@@ -2614,7 +2706,7 @@ int tg_gui_emoji_cell_at(const tg_gui_state *state, int width, int lh,
     int row;
     int cell;
 
-    if (state == 0 || !state->emoji_active) {
+    if (state == 0 || !state->emoji_enabled || !state->emoji_active) {
         return -1;
     }
     /* The panel the user sees is the one the painter laid out: same width
@@ -2699,7 +2791,7 @@ static void tg_gui_emoji_paint(const tg_gui_state *state,
     tg_gui_emoji_geom geo;
     int cell;
 
-    if (!state->emoji_active) {
+    if (!state->emoji_enabled || !state->emoji_active) {
         return;
     }
     tg_gui_emoji_geom_w = width;
@@ -2856,6 +2948,7 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
     int input_h;
     int box_top;
     int rows;
+    int text_base;
 
     width = backend->width(backend);
     height = backend->height(backend);
@@ -2870,6 +2963,11 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
     rows = tg_gui_input_rows(state, backend, width, sidebar_w);
     input_h = (rows * lh) + 14;
     box_top = content_h - input_h;
+    /* Centre the glyph cells, including their descenders. The first row has
+       the same top padding at every wrap count; later rows add only leading.
+       A baseline derived from lh alone sat low with tall MorphOS fonts. */
+    text_base = tg_gui_centred_baseline(backend, box_top,
+                                        lh - 2 + 2 * TG_GUI_INPUT_TEXT_PAD);
 
     /* When replying, a dim header strip sits ABOVE the box (the box itself does
        not move -- tg_gui_input_h reserved the extra line so the transcript
@@ -2920,7 +3018,7 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
         int k;
 
         n = tg_gui_wrap(backend, state->input,
-                        tg_gui_input_text_w(width, sidebar_w), starts, lengths,
+                        tg_gui_input_text_w(state, width, sidebar_w), starts, lengths,
                         TG_GUI_WRAP_MAX_LINES);
         if (n < 1) {
             n = 1;
@@ -2962,14 +3060,15 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
                     backend->fill_rect(
                         backend, TG_GUI_PEN_SELECT,
                         tg_gui_make_rect(x0,
-                                         box_top + ((k - first) * lh) + 4,
-                                         sw, lh));
+                                         box_top + ((k - first) * lh) +
+                                             TG_GUI_INPUT_TEXT_PAD,
+                                         sw, lh - 2));
                 }
             }
         }
         for (k = first; k < n && (k - first) < rows; ++k) {
             backend->draw_text(backend, TG_GUI_PEN_TEXT, area_x,
-                               box_top + ((k - first) * lh) + lh + 2,
+                               text_base + ((k - first) * lh),
                                state->input + starts[k], lengths[k]);
         }
         if (state->composing && state->cursor_on) {
@@ -2999,24 +3098,27 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
                           1;
                 /* Same baseline the line's text was drawn from, just above. */
                 tg_gui_draw_caret(backend, TG_GUI_PEN_TEXT, caret_x,
-                                  box_top + ((line - first) * lh) + lh + 2);
+                                  text_base + ((line - first) * lh));
             }
         }
     } else if (state->composing) {
         if (state->cursor_on) {
             /* Empty composer: the baseline the first typed line will use. */
             tg_gui_draw_caret(backend, TG_GUI_PEN_TEXT, area_x,
-                              box_top + lh + 2);
+                              text_base);
         }
     } else {
         backend->draw_text(backend, TG_GUI_PEN_TEXT_DIM, area_x,
-                           box_top + lh + 2, "Write a message...", 18UL);
+                           text_base, "Write a message...", 18UL);
     }
     backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
                        tg_gui_make_rect(width - 64, box_top, 56, input_h - 4));
     backend->draw_text(backend, TG_GUI_PEN_ACCENT_TEXT, width - 56,
-                       box_top + lh + 2, "Send", 4UL);
-    tg_gui_paint_emoji_button(state, backend, width, box_top, input_h);
+                       tg_gui_centred_baseline(backend, box_top, input_h - 4),
+                       "Send", 4UL);
+    if (state->emoji_enabled) {
+        tg_gui_paint_emoji_button(state, backend, width, box_top, input_h);
+    }
 
     tg_gui_paint_popups_at(state, backend, width, height, lh, box_top);
 }
@@ -3603,7 +3705,8 @@ int tg_gui_hit_test(const tg_gui_state *state, int width, int height, int lh,
             }
             return TG_GUI_HIT_INPUT;
         }
-        if (x >= width - 64 - TG_GUI_EMOJI_BUTTON_W && x < width - 64) {
+        if (state->emoji_enabled &&
+            x >= width - 64 - TG_GUI_EMOJI_BUTTON_W && x < width - 64) {
             return TG_GUI_HIT_EMOJI_BUTTON;
         }
         if (x >= width - 64) {
@@ -3936,18 +4039,46 @@ static int tg_gui_context_items(const tg_gui_state *state, const char **labels,
 
 int tg_gui_photo_default_filename(char *out, unsigned long out_size,
                                   unsigned long photo_id_hi,
-                                  unsigned long photo_id_lo)
+                                  unsigned long photo_id_lo,
+                                  const char *source_path)
 {
+    static const unsigned char png_magic[8] = {
+        0x89U, 'P', 'N', 'G', 13U, 10U, 26U, 10U
+    };
+    FILE *file;
+    unsigned char magic[8];
+    size_t got;
+    const char *extension;
     unsigned long short_id;
     char name[40];
     unsigned long length;
 
-    if (out == 0 || out_size == 0UL ||
-        (photo_id_hi == 0UL && photo_id_lo == 0UL)) {
+    if (out == 0 || out_size == 0UL) {
+        return 1;
+    }
+    out[0] = '\0';
+    if (source_path == 0 || (photo_id_hi == 0UL && photo_id_lo == 0UL)) {
+        return 1;
+    }
+    /* Telegram can re-encode an uploaded PNG. Name the bytes we actually
+       received, never the upload's name or the internal cache suffix. */
+    file = fopen(source_path, "rb");
+    if (file == 0) {
+        return 1;
+    }
+    got = fread(magic, 1, sizeof(magic), file);
+    fclose(file);
+    if (got == sizeof(magic) && memcmp(magic, png_magic, sizeof(magic)) == 0) {
+        extension = "png";
+    } else if (got >= 3U && magic[0] == 0xffU && magic[1] == 0xd8U &&
+               magic[2] == 0xffU) {
+        extension = "jpg";
+    } else {
         return 1;
     }
     short_id = photo_id_lo != 0UL ? photo_id_lo : photo_id_hi;
-    sprintf(name, "photo-%08lx.jpg", short_id);
+    short_id &= 0xffffffffUL;
+    sprintf(name, "photo-%08lx.%.3s", short_id, extension);
     length = (unsigned long)strlen(name);
     if (length + 1UL > out_size) {
         out[0] = '\0';
@@ -4731,11 +4862,30 @@ int tg_gui_self_test(void)
     /* Save-as naming/path joining is platform-neutral. Existing destinations
        are rejected until the requester explicitly confirms replacement. */
     {
+        static const unsigned char jpeg_header[] = { 0xffU, 0xd8U, 0xffU };
+        static const unsigned char png_header[] = {
+            0x89U, 'P', 'N', 'G', 13U, 10U, 26U, 10U
+        };
+        const char *fixture = "tg-photo-name-selftest.png";
+        FILE *file;
         char name[40];
         char path[80];
+        int named;
 
-        if (tg_gui_photo_default_filename(name, sizeof(name), 0x11UL,
-                                          0x1234UL) != 0 ||
+        /* A JPEG under a .png name must still be suggested as .jpg. */
+        file = fopen(fixture, "wb");
+        if (file == 0) {
+            return 2;
+        }
+        named = fwrite(jpeg_header, 1, sizeof(jpeg_header), file) ==
+                sizeof(jpeg_header);
+        if (fclose(file) != 0) {
+            named = 0;
+        }
+        named = named && tg_gui_photo_default_filename(
+                            name, sizeof(name), 0x11UL, 0x1234UL, fixture) == 0;
+        (void)remove(fixture);
+        if (!named ||
             strcmp(name, "photo-00001234.jpg") != 0 ||
             tg_gui_photo_build_destination(path, sizeof(path),
                                            "RAM:Downloads", name) != 0 ||
@@ -4747,6 +4897,42 @@ int tg_gui_self_test(void)
             !tg_gui_photo_save_allowed(1, 1) ||
             !tg_gui_photo_save_allowed(0, 0)) {
             puts("gui self-test: photo save-as path policy mismatch");
+            return 2;
+        }
+        /* Cache names currently end in .jpg. A PNG keeps its actual format,
+           including after a fresh fetch; a missing/unknown header is refused. */
+        fixture = "tg-photo-name-selftest.jpg";
+        file = fopen(fixture, "wb");
+        if (file == 0) {
+            return 2;
+        }
+        named = fwrite(png_header, 1, sizeof(png_header), file) ==
+                sizeof(png_header);
+        if (fclose(file) != 0) {
+            named = 0;
+        }
+        named = named && tg_gui_photo_default_filename(
+                            name, sizeof(name), 0x11UL, 0x1234UL, fixture) == 0;
+        if (!named || strcmp(name, "photo-00001234.png") != 0 ||
+            tg_gui_photo_default_filename(name, 5UL, 0x11UL, 0x1234UL,
+                                           fixture) == 0 || name[0] != '\0') {
+            (void)remove(fixture);
+            puts("gui self-test: PNG save-as format mismatch");
+            return 2;
+        }
+        file = fopen(fixture, "wb");
+        if (file == 0) {
+            return 2;
+        }
+        (void)fwrite(png_header, 1, 7U, file);
+        fclose(file);
+        named = tg_gui_photo_default_filename(name, sizeof(name), 0x11UL,
+                                               0x1234UL, fixture);
+        (void)remove(fixture);
+        if (named == 0 || name[0] != '\0' ||
+            tg_gui_photo_default_filename(name, sizeof(name), 0x11UL,
+                                           0x1234UL, fixture) == 0) {
+            puts("gui self-test: unknown/missing photo got a format");
             return 2;
         }
     }
@@ -4959,6 +5145,73 @@ int tg_gui_self_test(void)
             backend.context = &record;
         }
 
+        /* Turning emoji off while composing removes both UI entry points,
+           closes the picker and keeps the existing pair intact. */
+        {
+            tg_gui_record disabled;
+            char kept[8];
+            int enabled_width;
+            int h;
+
+            state.input[0] = '\0';
+            state.input_caret = 0;
+            if (!tg_gui_composer_insert_emoji(&state, 0UL)) {
+                puts("gui self-test: emoji toggle fixture");
+                return 2;
+            }
+            strcpy(kept, state.input);
+            tg_gui_emoji_open(&state);
+            enabled_width = tg_gui_input_text_w(&state, 480, tg_gui_sidebar_w(480));
+            tg_gui_set_emoji_enabled(&state, 0);
+            if (state.emoji_active || !state.emoji_explicit ||
+                !state.emoji_default_resolved || !state.inline_photos) {
+                puts("gui self-test: emoji toggle did not close picker independently");
+                return 2;
+            }
+            tg_gui_emoji_open(&state);
+            if (state.emoji_active || tg_gui_emoji_pick(&state) ||
+                tg_gui_composer_insert_emoji(&state, 1UL) ||
+                strcmp(kept, state.input) != 0 || state.input_caret != 2) {
+                puts("gui self-test: disabled emoji changed the composer");
+                return 2;
+            }
+            memset(&disabled, 0, sizeof(disabled));
+            disabled.width = 480;
+            disabled.height = 320;
+            backend.context = &disabled;
+            tg_gui_paint(&state, &backend);
+            if (disabled.glyphs != 0 ||
+                tg_gui_hit_test(&state, 480, 320, 10, 480 - 64 - 4, 292) !=
+                    TG_GUI_HIT_INPUT ||
+                tg_gui_input_text_w(&state, 480, tg_gui_sidebar_w(480)) <=
+                    enabled_width) {
+                puts("gui self-test: disabled emoji still paints or reserves its button");
+                return 2;
+            }
+            for (h = 8; h <= 24; ++h) {
+                if (tg_gui_emoji_inline_size(&state, h) != 0) {
+                    puts("gui self-test: disabled emoji still selects graphical text");
+                    return 2;
+                }
+            }
+            tg_gui_set_emoji_enabled(&state, 1);
+            for (h = 8; h <= 24; ++h) {
+                if (tg_gui_emoji_inline_size(&state, h) != (h < 12 ? 0 : h)) {
+                    puts("gui self-test: enabled emoji font fallback mismatch");
+                    return 2;
+                }
+            }
+            tg_gui_emoji_open(&state);
+            if (!state.emoji_active || strcmp(kept, state.input) != 0) {
+                puts("gui self-test: emoji cannot be enabled again");
+                return 2;
+            }
+            tg_gui_emoji_close(&state);
+            state.input[0] = '\0';
+            state.input_caret = 0;
+            backend.context = &record;
+        }
+
         /* 0.0.92: with inline photos off, a sticker's marker says what the
            sticker is instead of "[Photo]", and it keeps the click target that
            opens the viewer. A photo's marker is unchanged. */
@@ -5060,17 +5313,17 @@ int tg_gui_self_test(void)
     }
 
     /* Hardware default matrix. Explicit OFF and ON win everywhere; without a
-       choice, only classic OS3 needs both a 040-class CPU and RTG. */
+       choice, classic Amiga hardware needs both a 040-class CPU and RTG. */
     {
         int explicit_choice;
         int value;
-        int classic_os3;
+        int classic_amiga;
         int cpu_040;
         int has_rtg;
 
         for (explicit_choice = 0; explicit_choice <= 1; ++explicit_choice) {
             for (value = 0; value <= 1; ++value) {
-                for (classic_os3 = 0; classic_os3 <= 1; ++classic_os3) {
+                for (classic_amiga = 0; classic_amiga <= 1; ++classic_amiga) {
                     for (cpu_040 = 0; cpu_040 <= 1; ++cpu_040) {
                         for (has_rtg = 0; has_rtg <= 1; ++has_rtg) {
                             int expected;
@@ -5078,10 +5331,10 @@ int tg_gui_self_test(void)
 
                             expected = explicit_choice
                                            ? value
-                                           : !(classic_os3 &&
+                                           : !(classic_amiga &&
                                                (!cpu_040 || !has_rtg));
-                            actual = tg_gui_inline_photos_resolve(
-                                explicit_choice, value, classic_os3, cpu_040,
+                            actual = tg_gui_graphics_resolve(
+                                explicit_choice, value, classic_amiga, cpu_040,
                                 has_rtg);
                             if (actual != expected) {
                                 puts("gui self-test: inline default matrix mismatch");
@@ -5091,6 +5344,89 @@ int tg_gui_self_test(void)
                     }
                 }
             }
+        }
+    }
+
+    /* Both features use the actual screen/CPU default, independently of each
+       other's saved choice. OCS/ECS/AGA all report a non-RTG screen here. */
+    {
+        static const int cases[][9] = {
+            /* Classic, 040+/PPC, RTG, photo/emoji explicit+value, results */
+            {1, 0, 0, 0, 1, 0, 1, 0, 0},
+            {1, 1, 0, 0, 1, 0, 1, 0, 0},
+            {1, 0, 1, 0, 1, 0, 1, 0, 0},
+            {1, 1, 1, 0, 0, 0, 0, 1, 1},
+            {0, 0, 0, 0, 0, 0, 0, 1, 1},
+            {1, 0, 0, 1, 1, 0, 1, 1, 0},
+            {1, 0, 0, 0, 1, 1, 1, 0, 1},
+            {1, 1, 1, 1, 0, 0, 0, 0, 1},
+            {1, 1, 1, 0, 0, 1, 0, 1, 0},
+            {0, 1, 1, 1, 0, 1, 0, 0, 0}
+        };
+        static tg_gui_state prefs;
+        unsigned long i;
+
+        for (i = 0UL; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            const int *c = cases[i];
+
+            memset(&prefs, 0, sizeof(prefs));
+            prefs.inline_photos_explicit = c[3];
+            prefs.inline_photos = c[4];
+            prefs.emoji_explicit = c[5];
+            prefs.emoji_enabled = c[6];
+            tg_gui_graphics_preferences_resolve(&prefs, c[0], c[1], c[2]);
+            if (prefs.inline_photos != c[7] || prefs.emoji_enabled != c[8] ||
+                prefs.inline_photos_explicit != c[3] || prefs.emoji_explicit != c[5] ||
+                !prefs.inline_photos_default_resolved || !prefs.emoji_default_resolved) {
+                printf("gui self-test: photo/emoji hardware case %lu failed\n", i);
+                return 2;
+            }
+            tg_gui_graphics_preferences_resolve(&prefs, 0, 1, 1);
+            if (prefs.inline_photos != c[7] || prefs.emoji_enabled != c[8]) {
+                puts("gui self-test: graphics choice changed during window reopen");
+                return 2;
+            }
+        }
+    }
+
+    /* Missing settings stay automatic; explicit emoji OFF/ON survives a new
+       run. A failed save must report failure instead of claiming persistence. */
+    {
+        const char *path = "tg-gui-emoji-self-test.tmp";
+        int enabled;
+        int explicit_choice;
+        int choice;
+
+        (void)remove(path);
+        tg_gui_emoji_preferences_load(path, &enabled, &explicit_choice);
+        if (!enabled || explicit_choice) {
+            puts("gui self-test: missing emoji preference is not automatic");
+            return 2;
+        }
+        for (choice = 0; choice <= 1; ++choice) {
+            if (tg_gui_emoji_preferences_save(path, choice) != 0) {
+                (void)remove(path);
+                puts("gui self-test: emoji preference save failed");
+                return 2;
+            }
+            tg_gui_emoji_preferences_load(path, &enabled, &explicit_choice);
+            if (enabled != choice || !explicit_choice) {
+                (void)remove(path);
+                puts("gui self-test: emoji preference round-trip failed");
+                return 2;
+            }
+        }
+        if (tg_gui_emoji_preferences_save(0, 0) == 0 ||
+            tg_gui_emoji_preferences_save("tg-gui-emoji-self-test.tmp/child", 0) == 0) {
+            (void)remove(path);
+            puts("gui self-test: emoji preference hid save failure");
+            return 2;
+        }
+        tg_gui_emoji_preferences_load(path, &enabled, &explicit_choice);
+        (void)remove(path);
+        if (!enabled || !explicit_choice) {
+            puts("gui self-test: failed emoji save changed prior choice");
+            return 2;
         }
     }
 

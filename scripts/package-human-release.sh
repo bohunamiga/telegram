@@ -494,15 +494,22 @@ Using the GUI
   as one complete coarse image, then refines through sharper quality passes;
   the same window is reused. The larger cache has a -l.jpg suffix in photos/.
 - Right-click a photo (or its [Photo] label) and choose "Save photo as..." to
-  keep the original JPEG under any drawer and name. Press S in the open viewer
-  for the same requester. An uncached photo is fetched first; replacing an
-  existing file always requires confirmation.
-- On AmigaOS 3, the first-run default is off when no RTG screen is available or
-  the CPU is below a 68040; every explicit toggle overrides that default and is
+  save the received image under any drawer and name. The suggested extension
+  follows the bytes: .png for PNG, .jpg for JPEG, with no conversion. Press S
+  in the open viewer for the same requester. An uncached image is fetched
+  before the requester opens; replacing an existing file requires confirmation.
+- The first-run default is off on native AGA/ECS/OCS screens (also on classic
+  OS4) or when the 68k CPU is below a 68040; explicit toggles override it and are
   remembered. On any slower machine, uncheck "Settings > Show inline photos".
   The conversation returns to lightweight [Photo] labels and does no background
   photo fetch or decode work. Click an individual [Photo] label to load only
   that image in the viewer. The choice is remembered for the next run.
+- "Settings > Enable emoji" controls the picker, its composer button and
+  graphical emoji in messages. Off closes the picker, restores text emoticons
+  and keeps any emoji already entered in the composer. Its choice is saved
+  independently of photos. It defaults off on AGA/ECS/OCS screens (including
+  classic OS4) or 68k CPUs below 68040; a manual choice overrides it. Even
+  when enabled, fonts below 12 pixels keep text emoticons for readability.
 - Videos show a frame and a pasted link shows its preview, with the picture
   when the page has one. Both go through the same photo pipeline, so the same
   "Show inline photos" setting governs them. Stickers show the emoji they
@@ -522,7 +529,8 @@ Using the GUI
   File or Cancel; ESC also cancels. The file's own bytes decide, not its name,
   and Telegram's photo limits (width plus height at most 10000, at most 20:1)
   are checked before anything is uploaded. A photo over 10 MiB is preserved
-  and sent as a document instead.
+  and sent as a document instead. Telegram can re-encode photos as JPEG;
+  choose File, then Download, to preserve an original PNG unchanged.
 - "Insert emoji..." in the Telegram menu (Amiga+E), or the smiley button next
   to Send, opens a panel above the composer: the recent ones first, then the
   whole set. Arrow keys move, ENTER
@@ -675,16 +683,24 @@ Usare la GUI
   piu' nitide; la stessa finestra viene riutilizzata. La copia grande in
   photos/ ha il suffisso -l.jpg.
 - Click destro su una foto (o sulla sua etichetta [Photo]) e scegli
-  "Save photo as..." per salvare il JPEG originale con drawer e nome a scelta.
-  Nel viewer premi S per aprire lo stesso requester. Se la foto non e' in cache
-  viene prima scaricata; la sostituzione di un file esistente chiede conferma.
-- Su AmigaOS 3 il primo avvio parte senza foto inline quando non e' disponibile
-  uno schermo RTG oppure la CPU e' inferiore al 68040; ogni scelta esplicita
+  "Save photo as..." per salvare l'immagine ricevuta con drawer e nome a scelta.
+  L'estensione suggerita segue i byte: .png per PNG, .jpg per JPEG, senza
+  conversioni. Nel viewer premi S per lo stesso requester. Se la foto non e'
+  in cache viene scaricata prima di aprirlo; sostituire un file chiede conferma.
+- Il primo avvio parte senza foto inline su schermi AGA/ECS/OCS (anche OS4
+  classic) oppure con CPU 68k inferiore al 68040; ogni scelta esplicita
   sostituisce il default e resta memorizzata. Su una macchina lenta togli la
   spunta da "Settings > Show inline photos" nel menu
   Telegram. La conversazione torna alle leggere etichette [Photo] e non avvia
   download o decodifiche in background. Clicca una singola [Photo] per caricare
   solo quella immagine nel viewer. La scelta resta memorizzata al riavvio.
+- "Settings > Enable emoji" controlla il pannello, la faccina del composer e
+  le emoji grafiche nei messaggi. Off chiude il pannello, mostra emoticon
+  testuali e conserva le emoji gia' inserite nel composer. La scelta viene
+  salvata separatamente dalle foto. Parte spento su schermi AGA/ECS/OCS
+  (anche OS4 classic) oppure con CPU 68k sotto il 68040; una scelta manuale sostituisce
+  il default. Anche quando attivo, con font sotto 12 pixel restano le emoticon
+  testuali per leggibilita'.
 - I video mostrano un fotogramma e un link incollato mostra la sua anteprima,
   con l'immagine se la pagina ne ha una. Passano dalla stessa pipeline delle
   foto, quindi li governa la stessa impostazione "Show inline photos". Gli
@@ -705,7 +721,8 @@ Usare la GUI
   scegliere Photo, File o Cancel; anche ESC annulla. Decidono i byte del file,
   non il nome, e i limiti Telegram per le foto (larghezza piu' altezza al
   massimo 10000, al massimo 20:1) sono controllati prima di caricare. Oltre
-  10 MiB viene inviato come file.
+  10 MiB viene inviato come file. Telegram puo' ricodificare le foto in JPEG;
+  scegli File e poi Download per conservare una PNG originale senza modifiche.
 - "Insert emoji..." nel menu Telegram (Amiga+E), o la faccina accanto a
   Send, apre un pannello sopra il composer: prima le emoji recenti, poi tutte. Le frecce si muovono, ENTER
   inserisce e lascia il pannello aperto, ESC lo chiude; anche un click

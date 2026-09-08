@@ -257,6 +257,9 @@ typedef struct tg_gui_state {
     int inline_photos;     /* resolved GUI preference for this run */
     int inline_photos_explicit; /* user saved an on/off choice */
     int inline_photos_default_resolved; /* hardware default sampled this run */
+    int emoji_enabled;    /* picker and graphical emoji; off keeps text emoticons */
+    int emoji_explicit;   /* user saved an on/off choice */
+    int emoji_default_resolved;
     int photo_dither;      /* TG_GUI_PHOTO_DITHER_*; default full */
     unsigned long photo_cache_limit_mb; /* 0 unlimited; default 50 MiB */
     /* Scrollbar geometry the painter caches each frame for the event loop's
@@ -504,11 +507,19 @@ int tg_gui_photo_preferences_save(const char *path, int inline_photos,
                                   int inline_photos_explicit,
                                   int photo_dither,
                                   unsigned long photo_cache_limit_mb);
-/* Pure policy: explicit user choice always wins. Otherwise only classic OS3
-   disables inline photos when either a 68040-class CPU or RTG is missing. */
-int tg_gui_inline_photos_resolve(int explicit_choice, int explicit_value,
-                                 int classic_os3, int cpu_at_least_040,
-                                 int has_rtg);
+/* Shared photo/emoji policy: explicit user choice wins. Otherwise classic
+   Amiga hardware needs a 68040-class CPU (or PPC) and an actual RTG screen. */
+int tg_gui_graphics_resolve(int explicit_choice, int explicit_value,
+                            int classic_amiga, int cpu_at_least_040, int has_rtg);
+void tg_gui_graphics_preferences_resolve(tg_gui_state *state, int classic_amiga,
+                                        int cpu_at_least_040, int has_rtg);
+/* Separate from photos: missing/auto uses the hardware default. */
+void tg_gui_emoji_preferences_load(const char *path, int *enabled,
+                                   int *explicit_choice);
+int tg_gui_emoji_preferences_save(const char *path, int enabled);
+void tg_gui_set_emoji_enabled(tg_gui_state *state, int enabled);
+/* Zero means text emoticons; otherwise the square used by width AND paint. */
+int tg_gui_emoji_inline_size(const tg_gui_state *state, int font_height);
 /* Compatibility wrappers for callers interested only in the first line. */
 int tg_gui_inline_photos_load(const char *path);
 int tg_gui_inline_photos_save(const char *path, int enabled);
@@ -573,10 +584,12 @@ int tg_gui_context_menu_measure(const tg_gui_state *state,
    message action. TG_MENU_DLDIR carries that separate command. */
 #define TG_GUI_CTX_ITEMS_MAX 10
 
-/* Pure helpers shared by the native save requester and host self-test. */
+/* Save-as helpers shared by the native requester and host self-test. The
+   suggested extension follows the cached file's JPEG/PNG signature. */
 int tg_gui_photo_default_filename(char *out, unsigned long out_size,
                                   unsigned long photo_id_hi,
-                                  unsigned long photo_id_lo);
+                                  unsigned long photo_id_lo,
+                                  const char *source_path);
 int tg_gui_photo_build_destination(char *out, unsigned long out_size,
                                    const char *drawer, const char *name);
 int tg_gui_photo_save_allowed(int destination_exists,

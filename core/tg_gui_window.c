@@ -296,31 +296,43 @@ static void tg_gui_amiga_close_cybergraphics(void)
 }
 #endif
 
-/* Resolve the adaptive default only after Intuition has selected the actual
-   screen. An explicit saved choice never enters this path. The result stays in
-   memory for the whole run, including iconify/own-screen reopen cycles. */
-static void tg_gui_window_resolve_inline_default(tg_gui_state *state,
-                                                 struct Window *window)
+/* Resolve both adaptive defaults only after Intuition selected the screen.
+   A library installed on an AGA/ECS/OCS screen is not proof of RTG. */
+static void tg_gui_window_resolve_graphics_defaults(tg_gui_state *state,
+                                                    struct Window *window)
 {
-#if defined(__amigaos3__)
-    ULONG depth;
-    int cpu_at_least_040;
-    int has_rtg;
+    int classic_amiga = 0;
+    int cpu_at_least_040 = 1;
+    int has_rtg = 1;
+#if defined(__amigaos3__) || defined(__amigaos4__)
+    struct BitMap *bitmap;
+#endif
 
-    if (state == 0 || window == 0 || state->inline_photos_explicit ||
-        state->inline_photos_default_resolved) {
+    if (state == 0 || window == 0 ||
+        (state->inline_photos_default_resolved && state->emoji_default_resolved)) {
         return;
     }
-    depth = GetBitMapAttr(window->WScreen->RastPort.BitMap, BMA_DEPTH);
+#if defined(__amigaos3__) || defined(__amigaos4__)
+    classic_amiga = 1;
+    bitmap = window->WScreen->RastPort.BitMap;
+#if defined(__amigaos3__)
     cpu_at_least_040 =
         SysBase != 0 &&
         (SysBase->AttnFlags & (AFF_68040 | AFF_68060)) != 0;
-    has_rtg = depth > 8UL || tg_gui_amiga_open_cybergraphics();
-    state->inline_photos = tg_gui_inline_photos_resolve(
-        0, state->inline_photos, 1, cpu_at_least_040, has_rtg);
-    state->inline_photos_default_resolved = 1;
+#endif
+    /* OS4 can also run on a classic machine's AGA screen. Its PPC passes
+       the CPU threshold, but the actual screen still needs to be RTG. */
+    has_rtg = bitmap != 0 &&
+        (GetBitMapAttr(bitmap, BMA_DEPTH) > 8UL ||
+         (tg_gui_amiga_open_cybergraphics() &&
+          tg_gui_cgx_get_map_attr(bitmap, CYBRMATTR_ISCYBERGFX) != 0UL));
+    tg_gui_log(has_rtg ? "graphics: RTG screen" : "graphics: native screen");
+    tg_gui_log(cpu_at_least_040 ? "graphics: cpu >= 040" : "graphics: cpu < 040");
+#endif
+    tg_gui_graphics_preferences_resolve(state, classic_amiga,
+                                       cpu_at_least_040, has_rtg);
     tg_gui_session_set_inline_photos(state->inline_photos);
-    if (!state->inline_photos) {
+    if (!state->inline_photos_explicit && !state->inline_photos) {
         if (!has_rtg && !cpu_at_least_040) {
             tg_gui_log("photo: inline default off (no RTG / cpu < 040)");
         } else if (!has_rtg) {
@@ -329,10 +341,9 @@ static void tg_gui_window_resolve_inline_default(tg_gui_state *state,
             tg_gui_log("photo: inline default off (cpu < 040)");
         }
     }
-#else
-    (void)state;
-    (void)window;
-#endif
+    if (!state->emoji_explicit && !state->emoji_enabled) {
+        tg_gui_log("emoji: default off (native screen or cpu < 040)");
+    }
 }
 
 /* Core GUI libraries share the window lifetime. Keep the required
@@ -477,6 +488,7 @@ static int tg_gui_amiga_afa_text_compat(void)
 #define TG_MENU_CACHE_UNLIMITED 21
 #define TG_MENU_CACHE_CLEAR 22
 #define TG_MENU_EMOJI 23
+#define TG_MENU_ENABLEEMOJI 24
 
 /* Dark-theme palette: one RGB triplet per pen role and per avatar tint. The
    backend resolves the renderer's pen indices to obtained pens here; a future
@@ -532,6 +544,7 @@ typedef struct tg_gui_photo_direct_op {
 
 typedef struct tg_gui_amiga_ctx {
     struct Window *window;
+    const tg_gui_state *state; /* live preference shared with viewer/popups */
     struct RastPort *rport;
     int origin_x;
     int origin_y;
@@ -656,15 +669,14 @@ static int tg_gui_amiga_run_width(tg_gui_amiga_ctx *ctx, const char *text,
     return (int)TextLength(ctx->rport, (STRPTR)text, (UWORD)length);
 }
 
-/* The square an emoji occupies inline: the font height, so a glyph sits in
-   the line like a wide letter. 16 px glyphs scale down to it (9 px on Topaz
-   8, 13 on the PPC and AROS defaults), the way avatars scale into a row. */
+/* The same size decision drives width and paint. Zero selects text emoticons
+   when emoji are disabled or the font is too small for a readable picture. */
 static int tg_gui_amiga_emoji_cell(const tg_gui_amiga_ctx *ctx)
 {
     int h = ctx->rport != 0 && ctx->rport->Font != 0
                 ? (int)ctx->rport->Font->tf_YSize : 8;
 
-    return h < 8 ? 8 : h;
+    return tg_gui_emoji_inline_size(ctx->state, h);
 }
 
 /* Pens for the sheet palette, resolved once per session through the same
@@ -698,7 +710,8 @@ static int tg_gui_amiga_glyph_image(tg_gui_backend *backend,
     const unsigned char *px;
     int y;
 
-    if (index >= tg_emoji_sheet_count || size <= 0 || ctx->rport == 0) {
+    if (ctx->state == 0 || !ctx->state->emoji_enabled ||
+        index >= tg_emoji_sheet_count || size <= 0 || ctx->rport == 0) {
         return 0;
     }
     tg_gui_amiga_emoji_pens();
@@ -733,11 +746,6 @@ static int tg_gui_amiga_glyph_image(tg_gui_backend *backend,
     return 1;
 }
 
-/* Under this cell size a 16 pixel picture reduced inline is a blob (Topaz 8
-   gives 9), so the text emoticon stands in for it there; the picker keeps
-   the pictures at their native size regardless. */
-#define TG_GUI_EMOJI_INLINE_MIN 12
-
 static int tg_gui_amiga_text_width(tg_gui_backend *backend, const char *text,
                                    unsigned long length)
 {
@@ -754,7 +762,7 @@ static int tg_gui_amiga_text_width(tg_gui_backend *backend, const char *text,
                 cell = tg_gui_amiga_emoji_cell(ctx);
             }
             w += tg_gui_amiga_run_width(ctx, text + run_start, i - run_start);
-            if (cell >= TG_GUI_EMOJI_INLINE_MIN) {
+            if (cell > 0) {
                 w += cell;
             } else {
                 const char *t = tg_gui_session_emoji_text(index);
@@ -1216,7 +1224,6 @@ typedef struct tg_gui_photo_save_job {
     int last_percent;
     unsigned long id_hi;
     unsigned long id_lo;
-    char destination[256];
 } tg_gui_photo_save_job;
 
 static tg_gui_photo_slot tg_gui_photo_slots[TG_GUI_PHOTO_SLOTS];
@@ -4273,7 +4280,7 @@ static void tg_gui_amiga_draw_text(tg_gui_backend *backend, int pen, int x,
             tg_gui_amiga_draw_run(ctx, pen, x, baseline, text + run_start,
                                   i - run_start);
             x += tg_gui_amiga_run_width(ctx, text + run_start, i - run_start);
-            if (cell >= TG_GUI_EMOJI_INLINE_MIN) {
+            if (cell > 0) {
                 ascent = ctx->rport != 0 && ctx->rport->Font != 0
                              ? (int)ctx->rport->Font->tf_Baseline : cell - 2;
                 tg_gui_amiga_glyph_image(backend, index, x,
@@ -5410,6 +5417,8 @@ static struct NewMenu tg_gui_newmenu[] = {
     { NM_ITEM,  NM_BARLABEL, 0, 0, 0, 0 },
     { NM_ITEM,  (STRPTR)"Show inline photos", 0, CHECKIT | MENUTOGGLE, 0,
       (APTR)TG_MENU_INLINEPHOTOS },
+    { NM_ITEM,  (STRPTR)"Enable emoji", 0, CHECKIT | MENUTOGGLE, 0,
+      (APTR)TG_MENU_ENABLEEMOJI },
     { NM_ITEM,  (STRPTR)"Photo dithering", 0, 0, 0, 0 },
     { NM_SUB,   (STRPTR)"Full", 0,
       CHECKIT | MENUTOGGLE, 0, (APTR)TG_MENU_DITHER_FULL },
@@ -5454,6 +5463,28 @@ static struct MenuItem *tg_gui_menu_find_userdata(struct Menu *menu, APTR data)
         }
     }
     return 0;
+}
+
+static void tg_gui_menu_set_emoji(struct Menu *menu, int enabled)
+{
+    struct MenuItem *item;
+
+    item = tg_gui_menu_find_userdata(menu, (APTR)TG_MENU_ENABLEEMOJI);
+    if (item != 0) {
+        if (enabled) {
+            item->Flags |= CHECKED;
+        } else {
+            item->Flags &= (UWORD)~CHECKED;
+        }
+    }
+    item = tg_gui_menu_find_userdata(menu, (APTR)TG_MENU_EMOJI);
+    if (item != 0) {
+        if (enabled) {
+            item->Flags |= ITEMENABLED;
+        } else {
+            item->Flags &= (UWORD)~ITEMENABLED;
+        }
+    }
 }
 
 static void tg_gui_menu_set_photo_dither(struct Menu *menu, int dither)
@@ -6311,7 +6342,7 @@ static int tg_gui_photo_file_exists(const char *path)
     return 1;
 }
 
-static int tg_gui_photo_cached_jpeg(char *path, unsigned long path_size,
+static int tg_gui_photo_cached_image(char *path, unsigned long path_size,
                                     unsigned long id_hi,
                                     unsigned long id_lo, int large_only)
 {
@@ -6353,11 +6384,11 @@ static int tg_gui_photo_copy_atomic(const char *source,
         return 0;
     }
     destination_len = (unsigned long)strlen(destination);
-    if (destination_len + 6UL >= sizeof(part)) {
+    if (destination_len > 255UL) {
         return 1;
     }
-    sprintf(part, "%s.part", destination);
-    sprintf(backup, "%s.bak", destination);
+    sprintf(part, "%.255s.part", destination);
+    sprintf(backup, "%.255s.bak", destination);
     in = fopen(source, "rb");
     if (in == 0) {
         return 1;
@@ -6418,10 +6449,11 @@ static int tg_gui_photo_copy_atomic(const char *source,
     return 0;
 }
 
-/* 1 selected, 0 cancelled, -1 requester/path failure. */
+/* 1 selected, 0 cancelled, -1 requester/path failure, -2 unknown format. */
 static int tg_gui_photo_pick_destination(struct Window *win,
                                          unsigned long id_hi,
                                          unsigned long id_lo,
+                                         const char *source,
                                          char *destination,
                                          unsigned long destination_size)
 {
@@ -6431,8 +6463,9 @@ static int tg_gui_photo_pick_destination(struct Window *win,
     int result;
 
     destination[0] = '\0';
-    if (tg_gui_photo_default_filename(name, sizeof(name), id_hi, id_lo) != 0) {
-        return -1;
+    if (tg_gui_photo_default_filename(name, sizeof(name), id_hi, id_lo,
+                                      source) != 0) {
+        return -2;
     }
     AslBase = OpenLibrary((CONST_STRPTR)"asl.library", 38L);
     if (AslBase == 0) {
@@ -6451,8 +6484,7 @@ static int tg_gui_photo_pick_destination(struct Window *win,
         TG_GUI_TAG("Save photo as"), ASLFR_DoSaveMode, TRUE,
         ASLFR_InitialDrawer, TG_GUI_TAG(tg_gui_session_download_dir()),
         ASLFR_InitialFile, TG_GUI_TAG(name),
-        /* Same visible pattern as the send side (issue #13): what lands here
-           is a JPEG, so the drawer listing shows the photos already saved. */
+        /* List both supported formats; the suggestion follows the bytes. */
         ASLFR_DoPatterns, TRUE,
         ASLFR_InitialPattern, TG_GUI_TAG("#?.(jpg|jpeg|png)"), TAG_DONE);
     selected = req != 0 && AslRequestTags(req, TAG_DONE);
@@ -6492,6 +6524,35 @@ static void tg_gui_photo_save_status(tg_gui_state *state,
     tg_gui_window_paint(state, backend);
 }
 
+/* The image must be present before opening ASL so an uncached PNG gets the
+   same correct extension as a cached one. Copy it unchanged in either case. */
+static void tg_gui_photo_save_ready(tg_gui_state *state,
+                                    struct Window *win,
+                                    tg_gui_backend *backend,
+                                    const char *source,
+                                    unsigned long id_hi,
+                                    unsigned long id_lo)
+{
+    char destination[256];
+    char line[192];
+    int picked;
+
+    picked = tg_gui_photo_pick_destination(
+        win, id_hi, id_lo, source, destination, sizeof(destination));
+    if (picked == 0) {
+        strcpy(line, "Photo save cancelled");
+    } else if (picked == -2) {
+        strcpy(line, "Could not read that photo's format");
+    } else if (picked < 0) {
+        strcpy(line, "Could not open the save requester");
+    } else if (tg_gui_photo_copy_atomic(source, destination) == 0) {
+        sprintf(line, "Saved: %.180s", destination);
+    } else {
+        strcpy(line, "Could not save that photo");
+    }
+    tg_gui_photo_save_status(state, backend, line);
+}
+
 static void tg_gui_photo_save_begin(tg_gui_state *state,
                                     struct Window *win,
                                     tg_gui_backend *backend,
@@ -6500,8 +6561,6 @@ static void tg_gui_photo_save_begin(tg_gui_state *state,
                                     unsigned long id_lo)
 {
     char source[64];
-    char line[192];
-    int picked;
 
     if (job->pending) {
         tg_gui_photo_save_status(state, backend,
@@ -6513,23 +6572,8 @@ static void tg_gui_photo_save_begin(tg_gui_state *state,
                                  "A transfer is already running");
         return;
     }
-    picked = tg_gui_photo_pick_destination(
-        win, id_hi, id_lo, job->destination, sizeof(job->destination));
-    if (picked == 0) {
-        return;
-    }
-    if (picked < 0) {
-        tg_gui_photo_save_status(state, backend,
-                                 "Could not open the save requester");
-        return;
-    }
-    if (tg_gui_photo_cached_jpeg(source, sizeof(source), id_hi, id_lo, 0)) {
-        if (tg_gui_photo_copy_atomic(source, job->destination) == 0) {
-            sprintf(line, "Saved: %.180s", job->destination);
-        } else {
-            strcpy(line, "Could not save that photo");
-        }
-        tg_gui_photo_save_status(state, backend, line);
+    if (tg_gui_photo_cached_image(source, sizeof(source), id_hi, id_lo, 0)) {
+        tg_gui_photo_save_ready(state, win, backend, source, id_hi, id_lo);
         return;
     }
     if (tg_gui_session_request_photo_jpeg(id_hi, id_lo, 1) == 0) {
@@ -6546,6 +6590,7 @@ static void tg_gui_photo_save_begin(tg_gui_state *state,
 }
 
 static int tg_gui_photo_save_tick(tg_gui_state *state,
+                                  struct Window *win,
                                   tg_gui_backend *backend,
                                   tg_gui_photo_save_job *job)
 {
@@ -6559,15 +6604,11 @@ static int tg_gui_photo_save_tick(tg_gui_state *state,
     if (!job->pending) {
         return 0;
     }
-    if (tg_gui_photo_cached_jpeg(source, sizeof(source), job->id_hi,
+    if (tg_gui_photo_cached_image(source, sizeof(source), job->id_hi,
                                  job->id_lo, 1)) {
-        if (tg_gui_photo_copy_atomic(source, job->destination) == 0) {
-            sprintf(line, "Saved: %.180s", job->destination);
-        } else {
-            strcpy(line, "Could not save that photo");
-        }
+        tg_gui_photo_save_ready(state, win, backend, source, job->id_hi,
+                                job->id_lo);
         memset(job, 0, sizeof(*job));
-        tg_gui_photo_save_status(state, backend, line);
         return 1;
     }
     pending = tg_gui_session_request_photo_jpeg(job->id_hi, job->id_lo, 1);
@@ -7671,6 +7712,7 @@ static int tg_gui_photo_viewer_open_window(tg_gui_photo_viewer *viewer,
         SetFont(viewer->ctx.rport, main_ctx->rport->Font);
     }
     viewer->ctx.line_h = main_ctx->line_h;
+    viewer->ctx.state = main_ctx->state;
     memcpy(viewer->ctx.pens, main_ctx->pens, sizeof(viewer->ctx.pens));
     memcpy(viewer->ctx.avatar_pens, main_ctx->avatar_pens,
            sizeof(viewer->ctx.avatar_pens));
@@ -8097,11 +8139,11 @@ static int tg_gui_run_window_once(tg_gui_state *state)
     }
 
     memset(&ctx, 0, sizeof(ctx));
+    ctx.state = state;
     memset(&viewer, 0, sizeof(viewer));
     memset(&photo_save, 0, sizeof(photo_save));
     ctx.photo_dither = state->photo_dither;
     own_scr = 0;
-    tg_gui_emoji_recent_load(state);
     tg_gui_window_load_geom(&init_w, &init_h, &init_x, &init_y, &init_own);
     want_own = init_own;
     /* Own-screen mode (opt-in " own" token in telegram-gui-win.txt): a PRIVATE
@@ -8265,7 +8307,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
     }
 
     ctx.rport = ctx.window->RPort;
-    tg_gui_window_resolve_inline_default(state, ctx.window);
+    tg_gui_window_resolve_graphics_defaults(state, ctx.window);
     if (own_scr != 0 && own_scr->RastPort.Font != 0) {
         /* SA_SysFont sets the SCREEN font, but a window RastPort still comes up
            with the fixed-width DefaultFont (autodoc caveat) -- adopt the screen
@@ -8340,6 +8382,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     }
                 }
                 tg_gui_menu_set_photo_dither(menu, state->photo_dither);
+                tg_gui_menu_set_emoji(menu, state->emoji_enabled);
                 tg_gui_menu_set_photo_cache_limit(
                     menu, state->photo_cache_limit_mb);
                 SetMenuStrip(ctx.window, menu);
@@ -9271,6 +9314,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                 mnum = msg_code;
                 for (;;) {
                     struct MenuItem *item = 0;
+                    UWORD next_mnum = MENUNULL;
 
                     {
                         APTR ud;
@@ -9287,6 +9331,8 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                             if (item == 0) {
                                 break;
                             }
+                            /* Settings can detach/reset the strip below. */
+                            next_mnum = item->NextSelect;
                             ud = GTMENUITEM_USERDATA(item);
                         }
                         if (ud == (APTR)TG_MENU_ABOUT) {
@@ -9569,6 +9615,27 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                         } else if (ud == (APTR)TG_MENU_DLDIR) {
                             tg_gui_window_pick_download_dir(state, ctx.window,
                                                             &backend);
+                        } else if (ud == (APTR)TG_MENU_ENABLEEMOJI) {
+                            tg_gui_set_emoji_enabled(state, !state->emoji_enabled);
+                            if (menu != 0) {
+                                ClearMenuStrip(ctx.window);
+                                tg_gui_menu_set_emoji(menu, state->emoji_enabled);
+                                SetMenuStrip(ctx.window, menu);
+                            }
+                            if (tg_gui_emoji_preferences_save(
+                                    "data/telegram-emoji.txt",
+                                    state->emoji_enabled) != 0) {
+                                tg_gui_window_copy(state->status,
+                                                   sizeof(state->status),
+                                                   "Could not save emoji setting");
+                            } else {
+                                tg_gui_window_copy(state->status,
+                                                   sizeof(state->status),
+                                                   state->emoji_enabled
+                                                       ? "Emoji enabled"
+                                                       : "Emoji disabled");
+                            }
+                            tg_gui_window_paint(state, &backend);
                         } else if (ud == (APTR)TG_MENU_INLINEPHOTOS) {
                             state->inline_photos = !state->inline_photos;
                             state->inline_photos_explicit = 1;
@@ -9728,7 +9795,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     if (item == 0) {
                         break; /* keyboard path: a single action */
                     }
-                    mnum = item->NextSelect;
+                    mnum = next_mnum;
                 }
             } else if (msg_class == IDCMP_NEWSIZE) {
                 int first_resize;
@@ -11019,7 +11086,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
             session_dirty = 1;
             viewer_dirty = 1;
         }
-        if (tg_gui_photo_save_tick(state, &backend, &photo_save)) {
+        if (tg_gui_photo_save_tick(state, ctx.window, &backend, &photo_save)) {
             session_dirty = 1;
         }
         /* Decode only on a permitted background turn. The budget begins at the
@@ -11396,6 +11463,9 @@ int tg_gui_run_window(tg_gui_state *state)
     if (state == 0) {
         return 2;
     }
+    tg_gui_emoji_preferences_load("data/telegram-emoji.txt",
+                                  &state->emoji_enabled, &state->emoji_explicit);
+    state->emoji_default_resolved = 0;
     if (state->photo_cache_limit_mb != TG_GUI_PHOTO_CACHE_UNLIMITED_MB &&
         state->photo_cache_limit_mb != 10UL &&
         state->photo_cache_limit_mb != 50UL &&
