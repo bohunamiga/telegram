@@ -179,6 +179,20 @@ typedef struct tg_mtproto_photo_meta {
     int from_document;
 } tg_mtproto_photo_meta;
 
+/* The bounded part of a WebPage that both clients can display. The parser
+   stops after its photo; embed/document/instant-view tails are not consumed. */
+#define TG_MTPROTO_WEBPAGE_TEXT_MAX 280U
+typedef struct tg_mtproto_web_page {
+    unsigned long id_hi;
+    unsigned long id_lo;
+    int pending;
+    char text[TG_MTPROTO_WEBPAGE_TEXT_MAX];
+    tg_mtproto_photo_meta photo;
+} tg_mtproto_web_page;
+
+tg_mtproto_tl_status tg_mtproto_read_web_page(tg_mtproto_tl_reader *reader,
+                                             tg_mtproto_web_page *out);
+
 /* Parses one bare Document (document#8fd4c4d8 / documentEmpty#36f8c871),
    reader positioned ON the constructor; leaves the reader right after the
    object (every variant is walked wire-exactly).
@@ -454,6 +468,8 @@ typedef struct tg_mtproto_message_text {
        synthetic "[Photo]" fallback from a real caption. */
     tg_mtproto_photo_meta photo;
     int photo_only;
+    unsigned long pending_webpage_hi;
+    unsigned long pending_webpage_lo;
 } tg_mtproto_message_text;
 
 typedef struct tg_mtproto_message_text_list {
@@ -473,6 +489,7 @@ typedef struct tg_mtproto_updates_summary {
     unsigned long id;
     unsigned long date;
     int has_sent_message;
+    tg_mtproto_web_page webpage;
 } tg_mtproto_updates_summary;
 
 tg_mtproto_tl_status tg_mtproto_build_invoke_with_layer(

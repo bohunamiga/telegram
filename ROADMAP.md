@@ -183,11 +183,11 @@ Plan, in order:
 2. DONE, and it cost nothing. A webPage photo is a plain Photo, so
    reading it hands the existing bounded pipeline exactly what it already
    knows, under the same Inline photos setting.
-3. Left for 0.0.93: `updateWebPage`, so a preview the server generates
-   late reaches an open chat. It only affects a link you send yourself
-   while the server is still fetching the page, it touches the update
-   path, and 0.0.92 is at full scope. Today a pending preview simply
-   stays silent until the history is read again.
+3. DONE for 0.0.93: `updateWebPage` and `updateChannelWebPage` complete a
+   pending preview in the open chat, matched by its 64-bit webpage id.
+   Both received messages and our own send echoes gain the title,
+   description and optional photo; the TUI updates its cached transcript.
+   Real-system validation remains part of the 0.0.93 release gate.
 
 Even complete, previews will stay per-link: the server builds them from
 the target page's metadata, so pages without usable metadata show none

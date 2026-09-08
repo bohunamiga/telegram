@@ -8,6 +8,11 @@ unless noted.
 ## [Unreleased]
 
 ### Added
+- A link preview that Telegram finishes later appears in the open chat by
+  itself, including on a link just sent from this client. The title and
+  description update the existing message; its picture uses the same Inline
+  photos setting and bounded pipeline. The text client's cached transcript
+  gains the preview too.
 - Emoji can be sent. "Insert emoji..." in the Telegram menu (Amiga+E) opens a
   panel above the composer: the recently used ones first, then the 109 emoji
   this client already reads back as text emoticons, in a grid walked with the

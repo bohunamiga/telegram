@@ -17,6 +17,7 @@
 
 #include "tg_chat_engine.h"
 #include "tg_gui.h"
+#include "tg_mtproto_login.h"
 
 typedef struct tg_gui_chat_driver {
     tg_gui_state *state; /* the GUI model this driver appends messages to */
@@ -77,6 +78,16 @@ int tg_gui_driver_update_text(tg_gui_chat_driver *gui, unsigned long message_id,
 int tg_gui_driver_update_text_utf8(tg_gui_chat_driver *gui,
                                    unsigned long message_id,
                                    const char *text);
+
+/* Attach send/history metadata, then complete every pending message with the
+   matching 64-bit webpage id. Text uses the edit path; photos remain lazy. */
+void tg_gui_driver_set_pending_webpage(tg_gui_chat_driver *gui,
+                                       unsigned long message_id,
+                                       unsigned long id_hi,
+                                       unsigned long id_lo);
+int tg_gui_driver_apply_webpage(tg_gui_chat_driver *gui,
+                                const tg_mtproto_web_page *page,
+                                int photo_ready);
 
 /* Delete: drop the shown message with this server id, shifting the tail up.
    Returns 1 if removed (a repaint is needed). */

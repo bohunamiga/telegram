@@ -190,6 +190,14 @@ static void tg_gui_driver_on_message(void *ctx, const tg_chat_message_row *row)
             tg_gui_message *m = &state->messages[di];
 
             if (m->id == row->id) {
+                if (row->pending_webpage_hi != 0UL || row->pending_webpage_lo != 0UL) {
+                    tg_gui_driver_copy_latin1(row_latin1, sizeof(row_latin1), row->text);
+                    have_l1 = 1;
+                    if (strcmp(m->text, row_latin1) == 0) {
+                        m->pending_webpage_hi = row->pending_webpage_hi;
+                        m->pending_webpage_lo = row->pending_webpage_lo;
+                    }
+                }
                 return; /* already shown (server id match) */
             }
             if (row->is_out && m->is_own && m->id == 0UL) {
@@ -200,6 +208,8 @@ static void tg_gui_driver_on_message(void *ctx, const tg_chat_message_row *row)
                 }
                 if (strcmp(m->text, row_latin1) == 0) {
                     m->id = row->id; /* the echo finally learns its server id */
+                    m->pending_webpage_hi = row->pending_webpage_hi;
+                    m->pending_webpage_lo = row->pending_webpage_lo;
                     if (m->id <= state->open_read_outbox_max) {
                         m->read_state = TG_GUI_READ_SEEN;
                     }
@@ -273,6 +283,8 @@ static void tg_gui_driver_on_message(void *ctx, const tg_chat_message_row *row)
     message->photo_id_lo = row->photo_id_lo;
     message->photo_width = row->photo_width;
     message->photo_height = row->photo_height;
+    message->pending_webpage_hi = row->pending_webpage_hi;
+    message->pending_webpage_lo = row->pending_webpage_lo;
 
     /* Sender label: own name when outgoing; the resolved sender otherwise; the
        1:1 peer name as the fallback; empty for an unresolved group author (the
@@ -456,6 +468,72 @@ int tg_gui_driver_update_text_utf8(tg_gui_chat_driver *gui,
     }
     tg_gui_driver_copy_latin1(latin1, sizeof(latin1), text);
     return tg_gui_driver_update_text(gui, message_id, latin1);
+}
+
+void tg_gui_driver_set_pending_webpage(tg_gui_chat_driver *gui,
+                                       unsigned long message_id,
+                                       unsigned long id_hi,
+                                       unsigned long id_lo)
+{
+    int i;
+
+    if (gui == 0 || gui->state == 0 || message_id == 0UL) {
+        return;
+    }
+    for (i = 0; i < gui->state->message_count; ++i) {
+        tg_gui_message *m = &gui->state->messages[i];
+
+        if (m->id == message_id) {
+            m->pending_webpage_hi = id_hi;
+            m->pending_webpage_lo = id_lo;
+            return;
+        }
+    }
+}
+
+int tg_gui_driver_apply_webpage(tg_gui_chat_driver *gui,
+                                const tg_mtproto_web_page *page,
+                                int photo_ready)
+{
+    static char text[TG_GUI_MSG_TEXT_MAX];
+    char suffix[TG_MTPROTO_WEBPAGE_TEXT_MAX];
+    unsigned long n;
+    int dirty;
+    int i;
+
+    if (gui == 0 || gui->state == 0 || page == 0 || page->pending ||
+        (page->id_hi == 0UL && page->id_lo == 0UL)) {
+        return 0;
+    }
+    dirty = 0;
+    tg_gui_driver_copy_latin1(suffix, sizeof(suffix), page->text);
+    for (i = 0; i < gui->state->message_count; ++i) {
+        tg_gui_message *m = &gui->state->messages[i];
+
+        if (m->pending_webpage_hi != page->id_hi ||
+            m->pending_webpage_lo != page->id_lo) {
+            continue;
+        }
+        tg_gui_driver_copy(text, sizeof(text), m->text);
+        n = (unsigned long)strlen(text);
+        if (suffix[0] != '\0' && n + 1UL < sizeof(text)) {
+            if (n != 0UL) text[n++] = '\n';
+            tg_gui_driver_copy(text + n, sizeof(text) - n, suffix);
+            (void)tg_gui_driver_update_text(gui, m->id, text);
+        }
+        m->pending_webpage_hi = 0UL;
+        m->pending_webpage_lo = 0UL;
+        m->has_photo = page->photo.has_photo;
+        m->photo_ready = photo_ready;
+        m->photo_only = 0;
+        m->photo_id_hi = page->photo.id_hi;
+        m->photo_id_lo = page->photo.id_lo;
+        m->photo_width = page->photo.width;
+        m->photo_height = page->photo.height;
+        gui->state->msg_gen++;
+        dirty = 1;
+    }
+    return dirty;
 }
 
 int tg_gui_driver_remove_by_id(tg_gui_chat_driver *gui, unsigned long message_id)
@@ -681,12 +759,140 @@ static void tg_gui_driver_emit(tg_chat_driver *driver, unsigned long epoch,
     driver->on_message(driver->ctx, &row);
 }
 
+static int tg_gui_driver_webpage_self_test(void)
+{
+    static tg_gui_state state;
+    static tg_mtproto_message_text message;
+    tg_gui_chat_driver gui;
+    tg_chat_driver driver;
+    tg_chat_message_row row;
+    tg_mtproto_tl_writer w;
+    tg_mtproto_tl_reader r;
+    tg_mtproto_updates_summary sent;
+    unsigned char wire[1024];
+    unsigned char pending[256];
+    unsigned long pending_len;
+    unsigned long gen;
+    unsigned long hi = 0x12345678UL;
+    unsigned long lo = 0x87654321UL;
+    int ok = 1;
+    int pass;
+
+#define W32(v) (ok = ok && tg_mtproto_tl_write_u32(&w, (v)) == TG_MTPROTO_TL_OK)
+#define W64(h,l) (ok = ok && tg_mtproto_tl_write_u64(&w, (h), (l)) == TG_MTPROTO_TL_OK)
+#define WSTR(s) (ok = ok && tg_mtproto_tl_write_bytes(&w, (const unsigned char *)(s), sizeof(s)-1UL) == TG_MTPROTO_TL_OK)
+    memset(&state, 0, sizeof(state));
+    tg_gui_chat_driver_bind(&gui, &state, &driver);
+    /* A received Message with webPagePending (including flags.0 url). */
+    tg_mtproto_tl_writer_init(&w, pending, sizeof(pending));
+    W32(0x9815cec8UL); W32(512UL); W32(0UL); W32(700UL);
+    W32(0x59511722UL); W64(0UL, 99UL); W32(1700000000UL);
+    WSTR("https://example.invalid/late"); W32(0xddf10c3bUL); W32(0UL);
+    W32(0xb0d13e47UL); W32(1UL); W64(hi, lo);
+    WSTR("https://example.invalid/late"); W32(1700000000UL);
+    pending_len = w.length;
+    tg_mtproto_tl_reader_init(&r, pending, pending_len);
+    if (!ok || tg_mtproto_read_update_message_text(&r, &message, 0) !=
+            TG_MTPROTO_TL_OK || message.pending_webpage_hi != hi ||
+        message.pending_webpage_lo != lo) return 0;
+    memset(&row, 0, sizeof(row));
+    row.id = message.id;
+    row.text = message.text;
+    row.sender = "Test sender";
+    row.reply_quote = "Test reply";
+    row.pending_webpage_hi = message.pending_webpage_hi;
+    row.pending_webpage_lo = message.pending_webpage_lo;
+    driver.on_message(driver.ctx, &row);
+
+    /* A short send response keeps the pending id for the optimistic echo. */
+    tg_mtproto_tl_writer_init(&w, wire, sizeof(wire));
+    W32(512UL | 2UL); W32(701UL); W32(10UL); W32(1UL); W32(1700000000UL);
+    W32(0xddf10c3bUL); W32(0UL); W32(0xb0d13e47UL); W32(0UL);
+    W64(hi,lo); W32(1700000000UL);
+    if (!ok || tg_mtproto_parse_updates_summary(0x9015e101UL, wire, w.length,
+            &sent) != TG_MTPROTO_TL_OK || !sent.has_sent_message ||
+        !sent.webpage.pending || sent.webpage.id_hi != hi || sent.webpage.id_lo != lo) return 0;
+    tg_gui_driver_append_own(&gui, "Own link", "Me", "Own reply", sent.id);
+    tg_gui_driver_set_pending_webpage(&gui, sent.id, sent.webpage.id_hi, sent.webpage.id_lo);
+
+    /* Saved Messages uses rich Updates and may clear Message.out. */
+    tg_mtproto_tl_writer_init(&w, wire, sizeof(wire));
+    W32(0x1cb5c415UL); W32(2UL); W32(0x4e90bfd6UL); W32(700UL); W64(0UL,1UL);
+    W32(0x1f2b0afdUL);
+    if (w.length + pending_len > sizeof(wire)) return 0;
+    memcpy(wire + w.length, pending, pending_len); w.length += pending_len;
+    W32(10UL); W32(1UL);
+    if (!ok || tg_mtproto_parse_updates_summary(0x74ae4240UL, wire, w.length,
+            &sent) != TG_MTPROTO_TL_OK || sent.id != 700UL ||
+        !sent.webpage.pending || sent.webpage.id_hi != hi || sent.webpage.id_lo != lo) return 0;
+
+    for (pass = 0; pass < 5; ++pass) {
+        unsigned long page_hi = pass == 0 ? hi + 1UL : hi;
+
+        tg_mtproto_tl_writer_init(&w, wire, sizeof(wire));
+        if (pass >= 3) {
+            /* Behind an unrelated update, exercising the envelope scan. */
+            W32(0x74ae4240UL); W32(0x1cb5c415UL); W32(2UL);
+            W32(0x1bfbd823UL); W32(0UL); /* updatePtsChanged + opaque field */
+        } else W32(0x78d4dec1UL);
+        W32(pass == 2 || pass == 4 ? 0x2f2ba99fUL : 0x7f891213UL);
+        if (pass == 2 || pass == 4) W64(0UL, 99UL);
+        W32(0xe89c45b2UL); W32(15UL | 16UL); W64(page_hi,lo);
+        WSTR("https://example.invalid/late"); WSTR("example.invalid"); W32(0UL);
+        WSTR("article"); WSTR("Test site"); WSTR("Late title");
+        WSTR("First description.\nIgnored second paragraph.");
+        /* Photo with a small JPEG size, through the existing photo parser. */
+        W32(0xfb197a65UL); W32(0UL); W64(0UL,42UL); W64(0UL,43UL);
+        WSTR("r"); W32(1700000000UL); W32(0x1cb5c415UL); W32(1UL);
+        W32(0x75c78e60UL); WSTR("m"); W32(320UL); W32(200UL); W32(4096UL);
+        W32(2UL); W32(12UL); W32(1UL); W32(1700000000UL);
+        gen = state.msg_gen;
+        if (!ok) return 0;
+        if (pass <= 2) {
+            /* Unknown high id, truncated photo, and wrong channel are inert. */
+            unsigned long len = pass == 1 ? w.length - 24UL : w.length;
+            if (tg_mtproto_test_webpage_update(&gui, wire, len, 0UL,0UL) ||
+                state.msg_gen != gen || state.message_count != 2) return 0;
+        } else {
+            if (pass == 4) {
+                tg_gui_driver_set_pending_webpage(&gui, 700UL, hi,lo);
+                strcpy(state.messages[0].text, "Channel link");
+            }
+            if (!tg_mtproto_test_webpage_update(&gui, wire, w.length, 0UL,
+                                                pass == 4 ? 99UL : 0UL) ||
+                state.message_count != 2 || state.msg_gen == gen ||
+                !strstr(state.messages[0].text, "\n[Link: Test site - Late title]\nFirst description.") ||
+                strstr(state.messages[0].text, "Ignored") ||
+                strcmp(state.messages[0].sender, "Test sender") ||
+                strcmp(state.messages[0].reply_text, "Test reply") ||
+                !state.messages[0].has_photo || state.messages[0].photo_id_lo != 42UL ||
+                state.messages[0].photo_width != 320UL || state.inline_photos != 0 ||
+                !state.messages[1].is_own || state.messages[1].read_state != TG_GUI_READ_SENT ||
+                strcmp(state.messages[1].reply_text, "Own reply") ||
+                !strstr(state.messages[1].text, "Late title")) return 0;
+            gen = state.msg_gen;
+            if (tg_mtproto_test_webpage_update(&gui, wire, w.length, 0UL,
+                                               pass == 4 ? 99UL : 0UL) ||
+                state.msg_gen != gen) return 0;
+        }
+    }
+#undef W32
+#undef W64
+#undef WSTR
+    return 1;
+}
+
 int tg_gui_driver_self_test(void)
 {
     tg_gui_state state;
     tg_gui_chat_driver gui;
     tg_chat_driver driver;
     int i;
+
+    if (!tg_gui_driver_webpage_self_test()) {
+        puts("gui driver self-test: delayed webpage replay failed");
+        return 2;
+    }
 
     memset(&state, 0, sizeof(state));
     tg_gui_chat_driver_bind(&gui, &state, &driver);

@@ -59,6 +59,8 @@
 #define tg_gui_driver_has_unseen_own(gui) (0)
 #define tg_gui_driver_update_text(gui, message_id, text) (0)
 #define tg_gui_driver_update_text_utf8(gui, message_id, text) (0)
+#define tg_gui_driver_set_pending_webpage(gui, msg, hi, lo) ((void)0)
+#define tg_gui_driver_apply_webpage(gui, page, ready) ((void)0, (void)(page), (void)(ready), 0)
 #define tg_gui_driver_remove_by_id(gui, message_id) (0)
 #define tg_gui_driver_mark_photo_ready(gui, id_hi, id_lo) (0)
 #endif
@@ -172,6 +174,10 @@ static int tg_mtproto_latin1_to_utf8(const char *src, char *dst,
 #define TG_MTPROTO_UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR 0x62ba04d9UL
 #define TG_MTPROTO_UPDATE_EDIT_MESSAGE_CONSTRUCTOR 0xe40370a3UL
 #define TG_MTPROTO_UPDATE_EDIT_CHANNEL_MESSAGE_CONSTRUCTOR 0x1b3f4df7UL
+/* https://core.telegram.org/constructor/updateWebPage and
+   /constructor/updateChannelWebPage, verified 2026-09-08 (layer 214). */
+#define TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR 0x7f891213UL
+#define TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR 0x2f2ba99fUL
 #define TG_MTPROTO_MESSAGE_CONSTRUCTOR 0x9815cec8UL
 #define TG_MTPROTO_TL_VECTOR_CONSTRUCTOR 0x1cb5c415UL
 #define TG_MTPROTO_UPDATES_TOO_LONG_CONSTRUCTOR 0xe317af7eUL
@@ -433,12 +439,25 @@ typedef struct tg_chat_edit_entry {
     unsigned long peer_id_lo;
     unsigned long message_id;
     char text[TG_GUI_MSG_TEXT_MAX];
+    unsigned long pending_webpage_hi;
+    unsigned long pending_webpage_lo;
 } tg_chat_edit_entry;
 typedef struct tg_chat_edit_sink {
     tg_chat_edit_entry queue[TG_CHAT_EDIT_QUEUE_MAX];
     unsigned long count;
 } tg_chat_edit_sink;
 static tg_chat_edit_sink *tg_chat_edit_target = 0;
+/* Defer application until the receive call returns: an update can arrive
+   during sendMessage, before the optimistic echo has entered the ring. */
+#define TG_CHAT_WEBPAGE_QUEUE_MAX 8U
+typedef struct tg_chat_webpage_entry {
+    unsigned long channel_hi;
+    unsigned long channel_lo;
+    tg_mtproto_web_page page;
+} tg_chat_webpage_entry;
+static tg_chat_webpage_entry tg_chat_webpages[TG_CHAT_WEBPAGE_QUEUE_MAX];
+static unsigned long tg_chat_webpage_count = 0UL;
+static tg_mtproto_web_page tg_chat_sent_webpage;
 /* The real console stream while the chat runs, for TUI components that must
    bypass capture streams (input-row redraws from the editor and the
    sub-prompts). 0 outside the chat. */
@@ -3209,6 +3228,8 @@ static void tg_chat_edit_parse_update(tg_mtproto_tl_reader *reader)
     }
     memcpy(entry->text, message.text, copy_length);
     entry->text[copy_length] = '\0';
+    entry->pending_webpage_hi = message.pending_webpage_hi;
+    entry->pending_webpage_lo = message.pending_webpage_lo;
 }
 
 static int tg_chat_edit_peer_matches_open(const tg_chat_edit_entry *entry,
@@ -3231,6 +3252,42 @@ static int tg_chat_edit_peer_matches_open(const tg_chat_edit_entry *entry,
            entry->peer_constructor == TG_MTPROTO_PEER_USER_CONSTRUCTOR;
 }
 
+static void tg_chat_webpage_parse_update(tg_mtproto_tl_reader *reader,
+                                          unsigned long constructor)
+{
+    static tg_chat_webpage_entry parsed;
+    unsigned long i;
+
+    memset(&parsed, 0, sizeof(parsed));
+    if (constructor == TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR &&
+        tg_mtproto_tl_read_u64(reader, &parsed.channel_hi,
+                               &parsed.channel_lo) != TG_MTPROTO_TL_OK) {
+        return;
+    }
+    if (tg_mtproto_read_web_page(reader, &parsed.page) != TG_MTPROTO_TL_OK ||
+        parsed.page.pending ||
+        (parsed.page.id_hi == 0UL && parsed.page.id_lo == 0UL) ||
+        reader->length - reader->offset < 8UL) {
+        return;
+    }
+    for (i = 0UL; i < tg_chat_webpage_count; ++i) {
+        if (tg_chat_webpages[i].channel_hi == parsed.channel_hi &&
+            tg_chat_webpages[i].channel_lo == parsed.channel_lo &&
+            tg_chat_webpages[i].page.id_hi == parsed.page.id_hi &&
+            tg_chat_webpages[i].page.id_lo == parsed.page.id_lo) {
+            tg_chat_webpages[i] = parsed;
+            return;
+        }
+    }
+    if (tg_chat_webpage_count == TG_CHAT_WEBPAGE_QUEUE_MAX) {
+        memmove(tg_chat_webpages, tg_chat_webpages + 1,
+                (TG_CHAT_WEBPAGE_QUEUE_MAX - 1U) * sizeof(*tg_chat_webpages));
+        --tg_chat_webpage_count;
+    }
+    tg_chat_webpages[tg_chat_webpage_count++] = parsed;
+    tg_gui_log("webpage: update queued");
+}
+
 /* A Vector<Update> is not length-prefixed per item. The normal collector can
    therefore consume only its first known item safely: a Message parser may
    intentionally stop after text when optional media/reply fields follow.
@@ -3246,8 +3303,7 @@ static void tg_chat_edit_scan_updates(const unsigned char *body,
     unsigned long constructor;
     unsigned long offset;
 
-    if (tg_chat_edit_target == 0 || body == 0 ||
-        start_offset >= body_length) {
+    if (body == 0 || start_offset >= body_length) {
         return;
     }
     offset = (start_offset + 3UL) & ~3UL;
@@ -3259,6 +3315,11 @@ static void tg_chat_edit_scan_updates(const unsigned char *body,
             tg_mtproto_tl_reader_init(&reader, body, body_length);
             reader.offset = offset + 4UL;
             tg_chat_edit_parse_update(&reader);
+        } else if (constructor == TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR ||
+                   constructor == TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR) {
+            tg_mtproto_tl_reader_init(&reader, body, body_length);
+            reader.offset = offset + 4UL;
+            tg_chat_webpage_parse_update(&reader, constructor);
         }
         offset += 4UL;
     }
@@ -3270,6 +3331,11 @@ static void tg_chat_edit_scan_updates(const unsigned char *body,
 static void tg_chat_collect_update_item(tg_mtproto_tl_reader *reader,
                                         unsigned long update_ctor)
 {
+    if (update_ctor == TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR ||
+        update_ctor == TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR) {
+        tg_chat_webpage_parse_update(reader, update_ctor);
+        return;
+    }
     if (update_ctor == TG_MTPROTO_UPDATE_USER_TYPING_CONSTRUCTOR ||
         update_ctor == TG_MTPROTO_UPDATE_CHAT_USER_TYPING_CONSTRUCTOR ||
         update_ctor == TG_MTPROTO_UPDATE_CHANNEL_USER_TYPING_CONSTRUCTOR) {
@@ -3348,7 +3414,9 @@ static void tg_chat_notify_collect_updates(const unsigned char *body,
             TG_MTPROTO_TL_OK) {
             return;
         }
-        if (item_constructor != TG_MTPROTO_UPDATE_USER_TYPING_CONSTRUCTOR &&
+        if (item_constructor != TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR &&
+            item_constructor != TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR &&
+            item_constructor != TG_MTPROTO_UPDATE_USER_TYPING_CONSTRUCTOR &&
             item_constructor !=
                 TG_MTPROTO_UPDATE_CHAT_USER_TYPING_CONSTRUCTOR &&
             item_constructor !=
@@ -8625,6 +8693,7 @@ static int tg_mtproto_auth_send_peer_on_context(
     int qrc;
     static const char label[] = "mtproto messages.sendMessage(peer)";
 
+    memset(&tg_chat_sent_webpage, 0, sizeof(tg_chat_sent_webpage));
     if (sent_message_id != 0) {
         *sent_message_id = 0UL;
     }
@@ -8691,6 +8760,7 @@ static int tg_mtproto_auth_send_peer_on_context(
     if (sent_message_id != 0 && updates.has_sent_message) {
         *sent_message_id = updates.id;
     }
+    tg_chat_sent_webpage = updates.webpage;
     return 0;
 }
 
@@ -9981,6 +10051,9 @@ static void tg_chat_console_on_message(void *ctx,
     tg_chat_console_driver *console = (tg_chat_console_driver *)ctx;
 
     tg_mtproto_chat_render_message(console->stream, row, console->day_shown);
+    tg_console_tui_capture_webpage(console->stream,
+                                   row->pending_webpage_hi, row->pending_webpage_lo,
+                                   row->webpage_channel_hi, row->webpage_channel_lo);
 }
 
 /* Golden parity harness for the transcript renderer. Drives
@@ -11176,6 +11249,12 @@ static int tg_mtproto_auth_print_history_text_peer_on_context(
                      texts.messages[i].reply_quote[0] != '\0')
                         ? texts.messages[i].reply_quote
                         : 0;
+                row.pending_webpage_hi = texts.messages[i].pending_webpage_hi;
+                row.pending_webpage_lo = texts.messages[i].pending_webpage_lo;
+                if (peer_constructor == TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR) {
+                    row.webpage_channel_hi = peer_id_hi;
+                    row.webpage_channel_lo = peer_id_lo;
+                }
                 row.id = texts.messages[i].id;
                 row.from_id_hi = texts.messages[i].from_id_hi;
                 row.from_id_lo = texts.messages[i].from_id_lo;
@@ -11818,6 +11897,32 @@ static void tg_mtproto_chat_load_own_label(const char *host,
     }
 }
 
+static int tg_mtproto_tui_apply_webpages(FILE *stream)
+{
+    unsigned long i;
+    int dirty = 0;
+
+    for (i = 0UL; i < tg_chat_webpage_count; ++i) {
+        tg_chat_webpage_entry *entry = &tg_chat_webpages[i];
+        char text[TG_MTPROTO_WEBPAGE_TEXT_MAX];
+        FILE *capture = tmpfile();
+        size_t n;
+
+        if (capture == 0) continue;
+        tg_mtproto_print_message_text(capture, entry->page.text);
+        rewind(capture);
+        n = fread(text, 1U, sizeof(text) - 1U, capture);
+        text[n] = '\0';
+        fclose(capture);
+        if (tg_console_tui_complete_webpage(stream, entry->page.id_hi,
+                entry->page.id_lo, entry->channel_hi, entry->channel_lo, text)) {
+            dirty = 1;
+        }
+    }
+    tg_chat_webpage_count = 0UL;
+    return dirty;
+}
+
 int tg_mtproto_auth_chat_file(const char *host,
                               const char *port,
                               const char *api_file,
@@ -11891,6 +11996,7 @@ int tg_mtproto_auth_chat_file(const char *host,
        init zeroes the updates cursor + notify queue and enables /diff. */
     tg_chat_engine_init(&chat_engine);
     tg_chat_nq = &chat_engine.notify;
+    tg_chat_webpage_count = 0UL;
     chat_quiet = 0;
     api_id[0] = '\0';
     saved_timeout = tg_net_connect_timeout_seconds();
@@ -12125,6 +12231,10 @@ int tg_mtproto_auth_chat_file(const char *host,
             line[0] = '\0';
             line_length = 0UL;
             tg_chat_caret = 0UL;
+        }
+        if (tg_mtproto_tui_apply_webpages(stream)) {
+            tg_mtproto_chat_show_prompt(stream, own_label, peer_label,
+                                        line, line_length, tg_chat_input_raw);
         }
         if (tg_console_tui_resize_pending()) {
             if (tg_console_tui_resize(stream, " Telegram Amiga ")) {
@@ -13290,6 +13400,18 @@ int tg_mtproto_auth_chat_file(const char *host,
             }
             tg_console_ui_reset(tui_cap);
             fputc('\n', tui_cap);
+            if (tg_chat_sent_webpage.pending) {
+                unsigned long pc, ph, pl, ah, al;
+                int has_hash;
+
+                if (tg_mtproto_load_peer_cache_peer(peer_cache_file, peer_index,
+                        &pc, &ph, &pl, &ah, &al, &has_hash, tui_cap, label) == 0) {
+                    tg_console_tui_capture_webpage(tui_cap,
+                        tg_chat_sent_webpage.id_hi, tg_chat_sent_webpage.id_lo,
+                        pc == TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR ? ph : 0UL,
+                        pc == TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR ? pl : 0UL);
+                }
+            }
             tg_console_tui_capture_end(tui_cap, stream);
         }
         tg_mtproto_chat_show_prompt(stream, own_label, peer_label, 0,
@@ -15105,6 +15227,7 @@ int tg_gui_session_open(const char *api_file, const char *auth_file,
        the notify back-pointer and arm collection before anything can recv. */
     tg_chat_engine_init(&tg_gui_session_state.engine);
     tg_chat_nq = &tg_gui_session_state.engine.notify;
+    tg_chat_webpage_count = 0UL;
     tg_chat_notify_reset(&tg_gui_session_state.engine.notify, 1);
     /* Arm the live typing sink (the push collector writes it; the tick reads it)
        and turn ON the update push stream so "<name> is typing" arrives -- typing
@@ -15255,6 +15378,7 @@ int tg_gui_session_open_chat(unsigned long peer_index, FILE *stream)
         return 0;
     }
     tg_gui_log("open_chat: start");
+    tg_chat_webpage_count = 0UL;
     /* Do not finish an old chat's thumbnails after the user switched. Fresh
        history below repopulates the bounded queue with the visible chat. */
     tg_gui_photo_queue_reset();
@@ -16242,6 +16366,20 @@ int tg_gui_session_send(const char *text, unsigned long reply_to_msg_id,
                                            ->reply_snippet
                                      : 0,
                                  sent_id);
+        tg_gui_driver_set_pending_webpage(&tg_gui_session_state.gui_driver,
+                                          sent_id, tg_chat_sent_webpage.id_hi,
+                                          tg_chat_sent_webpage.id_lo);
+        if (!tg_chat_sent_webpage.pending) {
+            int ready = tg_gui_photo_cache_exists(
+                tg_chat_sent_webpage.photo.id_hi,
+                tg_chat_sent_webpage.photo.id_lo, 0);
+
+            if (tg_gui_driver_apply_webpage(&tg_gui_session_state.gui_driver,
+                                            &tg_chat_sent_webpage, ready) &&
+                tg_chat_sent_webpage.photo.has_photo) {
+                tg_gui_photo_catalog_offer(&tg_chat_sent_webpage.photo);
+            }
+        }
     }
     tg_net_set_connect_timeout_seconds(prev_timeout);
     tg_mtproto_close_quiet_stream(quiet, stream);
@@ -16337,6 +16475,8 @@ int tg_gui_session_edit(const char *text, unsigned long message_id, FILE *stream
         tg_gui_session_state.current_peer_index, message_id, edit_text, quiet);
     if (rc == 0) {
         /* Update the on-screen bubble at once with the ORIGINAL Latin-1 text. */
+        tg_gui_driver_set_pending_webpage(&tg_gui_session_state.gui_driver,
+                                          message_id, 0UL, 0UL);
         (void)tg_gui_driver_update_text(&tg_gui_session_state.gui_driver,
                                         message_id, text);
     }
@@ -19048,6 +19188,67 @@ static const char *tg_gui_session_resolve_typing_member(FILE *stream)
     return 0;
 }
 
+static int tg_gui_session_apply_webpage_updates(void)
+{
+    unsigned long i;
+    int dirty = 0;
+
+    for (i = 0UL; i < tg_chat_webpage_count; ++i) {
+        tg_chat_webpage_entry *entry = &tg_chat_webpages[i];
+        int channel = entry->channel_hi != 0UL || entry->channel_lo != 0UL;
+        int open_channel = tg_gui_session_state.open_peer_constructor ==
+            TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR;
+        int ready;
+
+        if (tg_gui_session_state.current_peer_index[0] == '\0' ||
+            channel != open_channel ||
+            (channel && (entry->channel_hi != tg_gui_session_state.open_peer_id_hi ||
+                         entry->channel_lo != tg_gui_session_state.open_peer_id_lo))) {
+            continue;
+        }
+        ready = entry->page.photo.has_photo && tg_gui_photo_cache_exists(
+            entry->page.photo.id_hi, entry->page.photo.id_lo, 0);
+        if (tg_gui_driver_apply_webpage(&tg_gui_session_state.gui_driver,
+                                        &entry->page, ready)) {
+            if (entry->page.photo.has_photo) {
+                tg_gui_photo_catalog_offer(&entry->page.photo);
+            }
+            tg_gui_log("webpage: pending bubble completed");
+            dirty = 1;
+        }
+    }
+    tg_chat_webpage_count = 0UL;
+    return dirty;
+}
+
+#if !defined(TG_NO_SELFTEST) && !defined(TG_NO_GUI)
+int tg_mtproto_test_webpage_update(tg_gui_chat_driver *gui,
+                                   const unsigned char *body, unsigned long length,
+                                   unsigned long channel_hi, unsigned long channel_lo)
+{
+    tg_chat_notify notify;
+    tg_chat_notify *saved_notify = tg_chat_nq;
+    int dirty;
+
+    memset(&notify, 0, sizeof(notify));
+    notify.armed = 1;
+    tg_chat_nq = &notify;
+    tg_chat_webpage_count = 0UL;
+    tg_gui_session_state.gui_driver = *gui;
+    strcpy(tg_gui_session_state.current_peer_index, "self");
+    tg_gui_session_state.open_peer_constructor = channel_hi || channel_lo
+        ? TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR : TG_MTPROTO_PEER_SELF_CONSTRUCTOR;
+    tg_gui_session_state.open_peer_id_hi = channel_hi;
+    tg_gui_session_state.open_peer_id_lo = channel_lo;
+    tg_chat_notify_collect(body, length);
+    dirty = tg_gui_session_apply_webpage_updates();
+    tg_chat_nq = saved_notify;
+    tg_gui_session_state.gui_driver.state = 0;
+    tg_gui_session_state.current_peer_index[0] = '\0';
+    return dirty;
+}
+#endif
+
 static int tg_gui_session_apply_edit_updates(void)
 {
     unsigned long i;
@@ -19069,6 +19270,9 @@ static int tg_gui_session_apply_edit_updates(void)
             tg_gui_driver_update_text_utf8(
                 &tg_gui_session_state.gui_driver, entry->message_id,
                 entry->text)) {
+            tg_gui_driver_set_pending_webpage(&tg_gui_session_state.gui_driver,
+                entry->message_id, entry->pending_webpage_hi,
+                entry->pending_webpage_lo);
             dirty = 1;
         }
     }
@@ -19227,6 +19431,9 @@ static int tg_gui_session_apply_pushes(FILE *stream, int allow_member_fetch)
 
     dirty = 0;
     if (tg_gui_session_apply_edit_updates()) {
+        dirty = 1;
+    }
+    if (tg_gui_session_apply_webpage_updates()) {
         dirty = 1;
     }
     if (tg_gui_session_apply_read_update()) {

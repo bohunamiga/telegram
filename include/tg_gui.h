@@ -238,6 +238,8 @@ typedef struct tg_gui_message {
     unsigned long photo_id_lo;
     unsigned long photo_width;
     unsigned long photo_height;
+    unsigned long pending_webpage_hi;
+    unsigned long pending_webpage_lo;
 } tg_gui_message;
 
 typedef struct tg_gui_state {

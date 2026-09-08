@@ -222,6 +222,13 @@ int tg_mtproto_auth_forget(const char *auth_file,
                            const char *code_hash_file,
                            FILE *stream);
 int tg_mtproto_probe_self_test(void);
+#if !defined(TG_NO_SELFTEST) && !defined(TG_NO_GUI)
+struct tg_gui_chat_driver;
+/* Replay the production collector/application path against an offline ring. */
+int tg_mtproto_test_webpage_update(struct tg_gui_chat_driver *gui,
+                                   const unsigned char *body, unsigned long length,
+                                   unsigned long channel_hi, unsigned long channel_lo);
+#endif
 
 /* Golden parity check for the transcript renderer (the chat model/view seam):
    renders a fixed message script with colours off and asserts byte-equality
