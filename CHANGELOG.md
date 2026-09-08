@@ -22,7 +22,8 @@ unless noted.
   edited and stepped over as one character, and goes out as its real Unicode
   codepoint. The pictures are Noto Emoji glyphs reduced to 16 pixels, shipped
   under the SIL Open Font License; see third_party/noto-emoji. A smiley
-  button between the input and Send opens the same panel with the mouse.
+  button between the input and Send opens the same panel with the mouse,
+  centred vertically on the visible input box even with a small font.
 - Received emoji show as pictures too, the same ones the picker offers, so a
   face someone sends and the one you answer with look alike. Where the font
   is too small for a readable picture (Topaz 8 gives nine pixels of cell) the

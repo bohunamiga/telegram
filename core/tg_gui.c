@@ -2377,7 +2377,8 @@ static void tg_gui_paint_emoji_button(const tg_gui_state *state,
         side = 8;
     }
     bx = width - 64 - TG_GUI_EMOJI_BUTTON_W + (TG_GUI_EMOJI_BUTTON_W - side) / 2;
-    by = box_top + (input_h - side) / 2;
+    /* The visible input and Send button leave four pixels below the row. */
+    by = box_top + (input_h - 4 - side) / 2;
     if (state->emoji_active) {
         backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
                            tg_gui_make_rect(bx - 2, by - 2, side + 4, side + 4));
