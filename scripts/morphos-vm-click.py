@@ -14,12 +14,11 @@ Usage:
   morphos-vm-click.py X Y --double
   morphos-vm-click.py X Y --crop x0 y0 x1 y1   # crop region for /tmp/vm_c.png
 """
-import subprocess, socket, sys, time
+import os, subprocess, socket, sys, time
 
 VNCDO = "/Users/kaffeine/amiga-dev/.venv-vnc/bin/vncdo"
 VNC = "127.0.0.1::5907"
-MON = ("/Volumes/EXT/Macchine Virtuali/Amiga/emu/telegram-amiga/"
-       "morphos/qemu-monitor.sock")
+MON = os.environ.get("MORPHOS_MON", "/tmp/morphos-monitor.sock")
 
 
 def req(sx, sy):

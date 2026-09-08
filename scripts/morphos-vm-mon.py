@@ -5,12 +5,11 @@ e.g.  morphos-vm-mon.py "screendump /tmp/m.ppm"
       morphos-vm-mon.py "sendkey ret"
       morphos-vm-mon.py "info status"
 """
-import socket
+import os, socket
 import sys
 import time
 
-SOCK = ("/Volumes/EXT/Macchine Virtuali/Amiga/emu/telegram-amiga/"
-        "morphos/qemu-monitor.sock")
+SOCK = os.environ.get("MORPHOS_MON", "/tmp/morphos-monitor.sock")
 
 
 def main():

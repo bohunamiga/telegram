@@ -12,10 +12,9 @@ Usage:
   morphos-vm-cmd.py --noshot "command"    # skip the screendump
 Screendump (when taken) -> /tmp/vm.png ; a cropped shell strip -> /tmp/vm_c.png
 """
-import socket, subprocess, sys, time
+import os, socket, subprocess, sys, time
 
-MON = ("/Volumes/EXT/Macchine Virtuali/Amiga/emu/telegram-amiga/"
-       "morphos/qemu-monitor.sock")
+MON = os.environ.get("MORPHOS_MON", "/tmp/morphos-monitor.sock")
 
 # char -> QEMU sendkey qcode (US keyboard)
 M = {}
