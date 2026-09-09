@@ -49,6 +49,11 @@ unless noted.
   client's /photo all take .png alongside .jpg.
 
 ### Fixed
+- Opening a photo's context menu or the Send photo dialog no longer freezes
+  AfAOS while drawing its labels. Popup areas are copied from the completed
+  buffer after photo replay, so menus, mentions and emoji stay above pictures
+  during full repaints, refreshes and caret updates. The photo dialog also
+  uses the compatible bitmap text and matching caption/button metrics.
 - Toggling emoji no longer resizes avatars in the chat list or header.
   The search field, chat rows and open-chat header keep their compact native
   font dimensions too, with centred text and avatars, including initials.

@@ -530,6 +530,7 @@ static const tg_gui_rgb tg_gui_avatar_rgb[TG_GUI_AVATAR_COLORS] = {
 };
 
 #define TG_GUI_PHOTO_DIRECT_OPS 24
+#define TG_GUI_POPUP_AREAS 3 /* context menu, mentions, emoji */
 
 struct tg_gui_photo_slot;
 
@@ -562,7 +563,9 @@ typedef struct tg_gui_amiga_ctx {
     int buf_w;               /* allocated buffer width  (== inner_w when valid) */
     int buf_h;               /* allocated buffer height (== inner_h when valid) */
     int buf_ok;              /* 1 iff buf_bm and buf_rp.Font are valid */
-    int bitmap_text_compat;  /* AfA_OS Text() cannot target this off-screen RP */
+    tg_gui_rect popup_areas[TG_GUI_POPUP_AREAS];
+    int popup_count;         /* opaque regions composed into the current buffer */
+    int bitmap_text_compat;  /* bypass AfA Text() in buffers and client dialogs */
     int photo_truecolor;      /* optional cybergraphics RGB888 row replay */
     int photo_cgx_checked;    /* destination bitmap passed the RGB write/read test */
     int photo_cgx_usable;
@@ -631,7 +634,7 @@ static unsigned long tg_gui_amiga_font_char_index(const struct TextFont *font,
    the native text engine's metrics, which can differ from the font-strike
    spacing used by our layerless-buffer fallback. Layout, click hit-testing and
    caret placement must use the exact same advance as the visible glyphs. */
-static int tg_gui_amiga_bitmap_text_width(const tg_gui_amiga_ctx *ctx,
+static int tg_gui_amiga_bitmap_text_width(const struct RastPort *rp,
                                           const char *text,
                                           unsigned long length)
 {
@@ -640,12 +643,11 @@ static int tg_gui_amiga_bitmap_text_width(const tg_gui_amiga_ctx *ctx,
     int width;
     int spacing;
 
-    font = ctx->buf_rp.Font != 0 ? ctx->buf_rp.Font : ctx->rport->Font;
+    font = rp->Font;
     if (font == 0) {
         return 0;
     }
-    spacing = ctx->buf_rp.Font != 0 ? (int)ctx->buf_rp.TxSpacing
-                                    : (int)ctx->rport->TxSpacing;
+    spacing = (int)rp->TxSpacing;
     width = 0;
     for (i = 0UL; i < length; ++i) {
         unsigned long index;
@@ -673,7 +675,8 @@ static int tg_gui_amiga_run_width(tg_gui_amiga_ctx *ctx, const char *text,
         length = 0x7fffUL; /* TextLength count is 16-bit; clamp defensively */
     }
     if (ctx->bitmap_text_compat) {
-        return tg_gui_amiga_bitmap_text_width(ctx, text, length);
+        return tg_gui_amiga_bitmap_text_width(
+            ctx->buf_rp.Font != 0 ? &ctx->buf_rp : ctx->rport, text, length);
     }
     return (int)TextLength(ctx->rport, (STRPTR)text, (UWORD)length);
 }
@@ -3701,6 +3704,55 @@ static int tg_gui_photo_direct_queue(tg_gui_amiga_ctx *ctx,
 #endif
 }
 
+static void tg_gui_amiga_popup_area(tg_gui_backend *backend, tg_gui_rect rect)
+{
+    tg_gui_amiga_ctx *ctx = (tg_gui_amiga_ctx *)backend->context;
+
+    if (ctx->rport == &ctx->buf_rp && ctx->popup_count < TG_GUI_POPUP_AREAS) {
+        ctx->popup_areas[ctx->popup_count++] = rect;
+    }
+}
+
+/* Popup text and glyphs are already in the buffer. Copy their opaque regions
+   back after RGB photo replay; never call the text renderer under the layer
+   lock. That bypassed the AfA bitmap-text path and froze the whole system.
+   Restore whole popups: a photo intersecting a dirty strip may be replayed
+   beyond that strip. The caller owns the window/BeginRefresh layer lock. */
+#if defined(TG_GUI_HAVE_CYBERGRAPHICS)
+static void tg_gui_window_restore_popups(tg_gui_amiga_ctx *ctx)
+{
+    int i;
+
+    if (!ctx->buf_ok || ctx->buf_bm == 0 || ctx->popup_count <= 0 ||
+        ctx->buf_w != ctx->inner_w || ctx->buf_h != ctx->inner_h) {
+        return;
+    }
+    for (i = 0; i < ctx->popup_count; ++i) {
+        tg_gui_rect r = ctx->popup_areas[i];
+        int x1 = r.x + r.w;
+        int y1 = r.y + r.h;
+
+        if (r.x < 0) {
+            r.x = 0;
+        }
+        if (r.y < 0) {
+            r.y = 0;
+        }
+        if (x1 > ctx->buf_w) {
+            x1 = ctx->buf_w;
+        }
+        if (y1 > ctx->buf_h) {
+            y1 = ctx->buf_h;
+        }
+        if (x1 > r.x && y1 > r.y) {
+            BltBitMapRastPort(ctx->buf_bm, r.x, r.y, ctx->rport,
+                              ctx->origin_x + r.x, ctx->origin_y + r.y,
+                              x1 - r.x, y1 - r.y, 0xC0);
+        }
+    }
+}
+#endif
+
 /* A full off-screen paint records the RGB photo rectangles when its friend
    bitmap is not CGX. Replay only the rectangles touched by the following
    window blit; the layer/BeginRefresh lock is owned by the caller. */
@@ -3750,9 +3802,11 @@ static int tg_gui_photo_direct_replay(tg_gui_amiga_ctx *ctx,
                 slot->state = 2;
                 slot->render_logged = 0;
             }
+            tg_gui_window_restore_popups(ctx);
             return 0;
         }
     }
+    tg_gui_window_restore_popups(ctx);
     return 1;
 #else
     (void)ctx;
@@ -4258,7 +4312,7 @@ static void tg_gui_amiga_draw_run(tg_gui_amiga_ctx *ctx, int pen, int x,
     SetAPen(ctx->rport, tg_gui_amiga_resolve_pen(ctx, pen));
     SetDrMd(ctx->rport, JAM1);
     Move(ctx->rport, ctx->origin_x + x, ctx->origin_y + baseline);
-    if (ctx->bitmap_text_compat && ctx->rport == &ctx->buf_rp) {
+    if (ctx->bitmap_text_compat) {
         tg_gui_amiga_blt_text(ctx->rport, ctx->origin_x + x,
                               ctx->origin_y + baseline, text, length);
     } else {
@@ -4490,6 +4544,7 @@ static void tg_gui_amiga_buffer_free(tg_gui_amiga_ctx *ctx)
     ctx->buf_ok = 0;
     ctx->buf_w = 0;
     ctx->buf_h = 0;
+    ctx->popup_count = 0;
 }
 
 /* AfA_OS performs opaque resize by stretching the window's current pixels
@@ -4643,6 +4698,7 @@ static void tg_gui_window_paint(const tg_gui_state *state,
         c->rport = &c->buf_rp;
         c->origin_x = 0;
         c->origin_y = 0;
+        c->popup_count = 0;
         tg_gui_paint(state, backend);
         if (profile_paint) {
             tg_gui_profile_active = 0;
@@ -4672,15 +4728,6 @@ static void tg_gui_window_paint(const tg_gui_state *state,
                           c->inner_w, c->inner_h, 0xC0);
         (void)tg_gui_photo_direct_replay(c, 0, 0,
                                          c->inner_w, c->inner_h);
-        /* The replay wrote photos straight into the window, on top of any
-           popup the buffer had composed last (field report on MorphOS: the
-           context menu, and now the emoji panel, behind a picture). Paint
-           the popups once more, directly on the window this time; the
-           painters use the same graphics calls the replay just did. */
-        if (state->ctx_visible || state->mention_active ||
-            state->emoji_active) {
-            tg_gui_paint_popups(state, backend);
-        }
         if (layer != 0) {
             UnlockLayerRom(layer);
         }
@@ -4769,6 +4816,11 @@ static void tg_gui_window_paint_caret(const tg_gui_state *state,
         c->rport = &c->buf_rp;
         c->origin_x = 0;
         c->origin_y = 0;
+        /* Search/login caret paints retain the rest of the buffer. Only the
+           composer painter rebuilds its popup areas along with the input. */
+        if (state->mode == TG_GUI_MODE_CHAT && !state->search_active) {
+            c->popup_count = 0;
+        }
         tg_gui_paint_caret(state, backend);
         c->rport = saved_rport;
         c->origin_x = saved_ox;
@@ -4780,7 +4832,8 @@ static void tg_gui_window_paint_caret(const tg_gui_state *state,
            copy for popups and other modes whose dirty geometry is wider. */
         if (c->bitmap_text_compat &&
             state->mode == TG_GUI_MODE_CHAT && !state->search_active &&
-            !state->mention_active && !state->ctx_visible) {
+            !state->mention_active && !state->ctx_visible &&
+            !state->emoji_active) {
             int input_h;
             int sidebar_w;
             int content_h;
@@ -5781,7 +5834,24 @@ static void tg_gui_sendphoto_text(tg_gui_sendphoto_ui *ui, int pen, int x,
     SetBPen(rp, ui->main_ctx->pens[TG_GUI_PEN_WINDOW]);
     SetDrMd(rp, JAM1);
     Move(rp, ui->win->BorderLeft + x, ui->win->BorderTop + baseline);
-    Text(rp, (STRPTR)text, (UWORD)len);
+    if (ui->main_ctx->bitmap_text_compat) {
+        tg_gui_amiga_blt_text(rp, ui->win->BorderLeft + x,
+                              ui->win->BorderTop + baseline, text, len);
+    } else {
+        Text(rp, (STRPTR)text, (UWORD)len);
+    }
+}
+
+/* The caption, caret and button hit boxes must use the same font strike as
+   the compatible painter. AfA's native text path can freeze this dialog
+   too, even before the first upload part is sent. */
+static int tg_gui_sendphoto_text_width(tg_gui_sendphoto_ui *ui,
+                                       const char *text, unsigned long len)
+{
+    if (ui->main_ctx->bitmap_text_compat) {
+        return tg_gui_amiga_bitmap_text_width(ui->win->RPort, text, len);
+    }
+    return (int)TextLength(ui->win->RPort, (STRPTR)text, (UWORD)len);
 }
 
 static void tg_gui_sendphoto_box(tg_gui_sendphoto_ui *ui, int pen, int x,
@@ -5806,22 +5876,19 @@ static void tg_gui_sendphoto_caption_row(tg_gui_sendphoto_ui *ui)
     tg_gui_sendphoto_box(ui, TG_GUI_PEN_SURFACE, 8, ui->cap_y, box_w, lh + 6);
     start = 0UL;
     while (start < ui->caption_len &&
-           (int)TextLength(rp, (STRPTR)(ui->caption + start),
-                           (UWORD)(ui->caption_len - start)) > box_w - 14) {
+           tg_gui_sendphoto_text_width(ui, ui->caption + start,
+                                       ui->caption_len - start) > box_w - 14) {
         ++start; /* keep the END visible while typing */
     }
     ascent = (rp->Font != 0) ? (int)rp->Font->tf_Baseline : lh - 2;
     if (ui->caption_len > start) {
-        SetAPen(rp, ui->main_ctx->pens[TG_GUI_PEN_TEXT]);
-        SetDrMd(rp, JAM1);
-        Move(rp, ui->win->BorderLeft + 12,
-             ui->win->BorderTop + ui->cap_y + 3 + ascent);
-        Text(rp, (STRPTR)(ui->caption + start),
-             (UWORD)(ui->caption_len - start));
+        tg_gui_sendphoto_text(ui, TG_GUI_PEN_TEXT, 12,
+                              ui->cap_y + 3 + ascent, ui->caption + start,
+                              ui->caption_len - start);
     }
     if (ui->cursor_on) {
-        int cx = 12 + (int)TextLength(rp, (STRPTR)(ui->caption + start),
-                                      (UWORD)(ui->caption_len - start)) + 1;
+        int cx = 12 + tg_gui_sendphoto_text_width(
+                          ui, ui->caption + start, ui->caption_len - start) + 1;
 
         tg_gui_sendphoto_box(ui, TG_GUI_PEN_TEXT, cx, ui->cap_y + 3, 2, lh);
     }
@@ -5861,8 +5928,8 @@ static void tg_gui_sendphoto_paint(tg_gui_sendphoto_ui *ui)
         int x = ui->iw - 8;
 
         for (i = 2; i >= 0; --i) {
-            int tw = (int)TextLength(rp, (STRPTR)labels[i],
-                                     (UWORD)strlen(labels[i]));
+            int tw = tg_gui_sendphoto_text_width(
+                ui, labels[i], (unsigned long)strlen(labels[i]));
 
             ui->btn_w[i] = tw + 16;
             x -= ui->btn_w[i];
@@ -5878,12 +5945,10 @@ static void tg_gui_sendphoto_paint(tg_gui_sendphoto_ui *ui)
 
             tg_gui_sendphoto_box(ui, fill, ui->btn_x[i], ui->btn_y,
                                  ui->btn_w[i], lh + 8);
-            SetAPen(rp, ui->main_ctx->pens[ink]);
-            SetDrMd(rp, JAM1);
-            Move(rp, ui->win->BorderLeft + ui->btn_x[i] + 8 +
-                     ((ui->btn_w[i] - 16 - tw) / 2),
-                 ui->win->BorderTop + ui->btn_y + 4 + ascent);
-            Text(rp, (STRPTR)labels[i], (UWORD)strlen(labels[i]));
+            tg_gui_sendphoto_text(ui, ink, ui->btn_x[i] + 8 +
+                                   ((ui->btn_w[i] - 16 - tw) / 2),
+                                  ui->btn_y + 4 + ascent, labels[i],
+                                  (unsigned long)strlen(labels[i]));
         }
     }
 }
@@ -8384,6 +8449,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
     backend.draw_text = tg_gui_amiga_draw_text;
     backend.set_style = tg_gui_amiga_set_style;
     backend.fill_pill = tg_gui_amiga_fill_pill;
+    backend.popup_area = tg_gui_amiga_popup_area;
     backend.round_bg = TG_GUI_PEN_WINDOW;
 
     mem_after = (unsigned long)AvailMem(MEMF_ANY);

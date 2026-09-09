@@ -2898,10 +2898,19 @@ void tg_gui_emoji_recent_save(const tg_gui_state *state)
     fclose(f);
 }
 
+/* Record exactly the opaque area that can cover a directly replayed photo. */
+static void tg_gui_popup_frame(tg_gui_backend *backend, int pen,
+                                tg_gui_rect rect)
+{
+    if (backend->popup_area != 0) {
+        backend->popup_area(backend, rect);
+    }
+    backend->fill_rect(backend, pen, rect);
+}
+
 /* The panel itself: accent frame, surface, one square per glyph, the
    highlighted cell in the accent pen. Without a glyph primitive (the
    recording backend) each cell shows a dot so geometry still exercises. */
-
 static void tg_gui_emoji_paint(const tg_gui_state *state,
                                tg_gui_backend *backend,
                                int width, int height, int lh, int box_top)
@@ -2924,9 +2933,9 @@ static void tg_gui_emoji_paint(const tg_gui_state *state,
         geo.y = 0;
     }
     tg_gui_emoji_geom_y = geo.y;
-    backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
-                       tg_gui_make_rect(geo.x - 1, geo.y - 1, geo.w + 2,
-                                        geo.h + 2));
+    tg_gui_popup_frame(backend, TG_GUI_PEN_ACCENT,
+                        tg_gui_make_rect(geo.x - 1, geo.y - 1, geo.w + 2,
+                                         geo.h + 2));
     backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
                        tg_gui_make_rect(geo.x, geo.y, geo.w, geo.h));
     for (cell = 0; cell < geo.total; ++cell) {
@@ -2963,12 +2972,7 @@ static void tg_gui_emoji_paint(const tg_gui_state *state,
     }
 }
 
-/* The popups that live above the composer: the mention list and the emoji
-   panel. Painted last by the composer painter, and again on demand by a
-   backend whose photo replay wrote over them. */
-static void tg_gui_paint_context_menu(const tg_gui_state *state,
-                                      tg_gui_backend *backend);
-
+/* The mention list and emoji panel are composed above the input row. */
 static void tg_gui_paint_popups_at(const tg_gui_state *state,
                                    tg_gui_backend *backend, int width,
                                    int height, int lh, int box_top)
@@ -2996,8 +3000,8 @@ static void tg_gui_paint_popups_at(const tg_gui_state *state,
         if (by < 0) {
             by = 0;
         }
-        backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
-                           tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
+        tg_gui_popup_frame(backend, TG_GUI_PEN_ACCENT,
+                            tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
         backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
                            tg_gui_make_rect(bx, by, bw, bh));
         for (mi = 0; mi < n; ++mi) {
@@ -3022,30 +3026,6 @@ static void tg_gui_paint_popups_at(const tg_gui_state *state,
         }
     }
     tg_gui_emoji_paint(state, backend, width, height, lh, box_top);
-}
-
-void tg_gui_paint_popups(const tg_gui_state *state, tg_gui_backend *backend)
-{
-    int width;
-    int height;
-    int lh;
-    int input_h;
-    int box_top;
-
-    if (state == 0 || backend == 0) {
-        return;
-    }
-    width = backend->width(backend);
-    height = backend->height(backend);
-    lh = backend->line_height(backend);
-    input_h = (state->input_h > 0) ? state->input_h : (lh + 14);
-    box_top = (height - (lh + 6)) - input_h;
-    if (state->ctx_visible) {
-        tg_gui_paint_context_menu(state, backend);
-    }
-    if (state->composing) {
-        tg_gui_paint_popups_at(state, backend, width, height, lh, box_top);
-    }
 }
 
 /* Draws just the bottom composer row: the input box (now wrapped to multiple
@@ -4380,8 +4360,8 @@ static void tg_gui_paint_context_menu(const tg_gui_state *state,
     /* System menu colours (0.0.8): the popup now matches the new-look
        menubar instead of the dark chat theme -- outline, background, text
        and the hover highlight all come from the screen's own pens. */
-    backend->fill_rect(backend, TG_GUI_PEN_MENU_FRAME,
-                       tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
+    tg_gui_popup_frame(backend, TG_GUI_PEN_MENU_FRAME,
+                        tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
     backend->fill_rect(backend, TG_GUI_PEN_MENU_BACK,
                        tg_gui_make_rect(bx, by, bw, bh));
     for (i = 0; i < n; ++i) {
@@ -4568,6 +4548,10 @@ typedef struct tg_gui_record {
     int photo_last_h;
     int texts;
     int glyphs; /* emoji glyph cells drawn through glyph_image */
+    tg_gui_rect popup_rects[3];
+    int popup_count;
+    int popup_pending;
+    int popup_frames;
     int min_x;
     int min_y;
     int max_x;
@@ -4658,6 +4642,14 @@ static void tg_gui_rec_fill(tg_gui_backend *backend, int pen, tg_gui_rect rect)
 
     record = (tg_gui_record *)backend->context;
     record->fills += 1;
+    if (record->popup_pending && record->popup_count <= 3) {
+        tg_gui_rect p = record->popup_rects[record->popup_count - 1];
+
+        if (p.x == rect.x && p.y == rect.y && p.w == rect.w && p.h == rect.h) {
+            ++record->popup_frames;
+        }
+        record->popup_pending = 0;
+    }
     /* The read double-check is the only thing drawn in the azure READ pen, so a
        fill in that pen proves the receipt mark rendered (its many tick segments
        just set the flag idempotently). */
@@ -4666,6 +4658,17 @@ static void tg_gui_rec_fill(tg_gui_backend *backend, int pen, tg_gui_rect rect)
     }
     tg_gui_rec_track(record, rect.x, rect.y);
     tg_gui_rec_track(record, rect.x + rect.w, rect.y + rect.h);
+}
+
+static void tg_gui_rec_popup(tg_gui_backend *backend, tg_gui_rect rect)
+{
+    tg_gui_record *record = (tg_gui_record *)backend->context;
+
+    if (record->popup_count < 3) {
+        record->popup_rects[record->popup_count] = rect;
+    }
+    ++record->popup_count;
+    record->popup_pending = 1;
 }
 
 static void tg_gui_rec_avatar(tg_gui_backend *backend, int color_index,
@@ -4811,6 +4814,7 @@ int tg_gui_self_test(void)
     backend.line_height = tg_gui_rec_line_height;
     backend.font_ascent = 0; /* recorder: exercise the renderer's fallback */
     backend.font_height = 0;
+    backend.popup_area = 0;
     backend.text_width = tg_gui_rec_text_width;
     backend.glyph_image = tg_gui_rec_glyph;
     backend.fill_rect = tg_gui_rec_fill;
@@ -5577,6 +5581,72 @@ int tg_gui_self_test(void)
             tg_gui_attachment_is_photo(0)) {
             puts("gui self-test: attachment photo/file choice mismatch");
             return 2;
+        }
+    }
+
+    /* A buffered backend must know every opaque popup area, including its
+       outline, to put it back above photos without calling a text renderer
+       under a native layer lock. Full and caret paints must agree, and a
+       closed popup must not leave a stale region in the next frame. */
+    {
+        static tg_gui_state draft;
+        int mask;
+        int caret;
+
+        for (mask = 0; mask < 8; ++mask) {
+            tg_gui_rect full[3];
+            int expected = ((mask & 1) != 0) + ((mask & 2) != 0) +
+                           ((mask & 4) != 0);
+
+            tg_gui_demo_state(&draft);
+            draft.messages[1].id = 2UL;
+            draft.composing = 1;
+            draft.ctx_visible = (mask & 1) != 0;
+            draft.ctx_msg = 1;
+            draft.ctx_x = 320;
+            draft.ctx_y = 200;
+            draft.mention_active = (mask & 2) != 0;
+            draft.mention_count = 1;
+            strcpy(draft.mention_items[0], "sample");
+            draft.emoji_enabled = 1;
+            draft.emoji_active = (mask & 4) != 0;
+            for (caret = 0; caret < 2; ++caret) {
+                tg_gui_record rec;
+                tg_gui_backend b = backend;
+                int p;
+
+                memset(&rec, 0, sizeof(rec));
+                rec.width = 640;
+                rec.height = 480;
+                b.context = &rec;
+                b.popup_area = tg_gui_rec_popup;
+                if (caret) {
+                    tg_gui_paint_caret(&draft, &b);
+                } else {
+                    tg_gui_paint(&draft, &b);
+                }
+                if (rec.popup_count != expected ||
+                    rec.popup_frames != expected) {
+                    puts("gui self-test: popup replay bounds miss an opaque frame");
+                    return 2;
+                }
+                for (p = 0; p < expected; ++p) {
+                    tg_gui_rect r = rec.popup_rects[p];
+
+                    if (r.w <= 2 || r.h <= 2 || r.x < -1 || r.y < -1 ||
+                        r.x + r.w > rec.width || r.y + r.h > rec.height) {
+                        puts("gui self-test: popup replay bounds leave the window");
+                        return 2;
+                    }
+                    if (!caret) {
+                        full[p] = r;
+                    } else if (r.x != full[p].x || r.y != full[p].y ||
+                               r.w != full[p].w || r.h != full[p].h) {
+                        puts("gui self-test: caret changes popup replay bounds");
+                        return 2;
+                    }
+                }
+            }
         }
     }
 

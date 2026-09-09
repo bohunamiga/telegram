@@ -115,6 +115,10 @@ struct tg_gui_backend {
        the renderer sets it before every round-chrome call, avatars included,
        so the smoothed edge blends toward the right background. */
     void (*fill_pill)(tg_gui_backend *backend, int pen, tg_gui_rect rect);
+    /* OPTIONAL: opaque popup bounds, including the frame. A buffered backend
+       can restore these pixels after direct photo replay without drawing text
+       or allocating glyphs while the window's layer is locked. */
+    void (*popup_area)(tg_gui_backend *backend, tg_gui_rect rect);
     int round_bg;
 };
 
@@ -457,11 +461,6 @@ void tg_gui_emoji_recent_save(const tg_gui_state *state);
 extern int tg_gui_emoji_geom_y; /* panel top as last painted (tests, hit checks) */
 /* Sheet index of a codepoint, or -1 when the sheet has no glyph for it. */
 int tg_gui_emoji_index_of(unsigned long codepoint);
-/* Paints the popups that must sit above everything else (context menu,
-   mention list, emoji panel), for a backend that has just replayed photos
-   straight into the window over them. */
-void tg_gui_paint_popups(const tg_gui_state *state, tg_gui_backend *backend);
-
 /* Repaints ONLY the active caret region (composer input row in chat mode, login
    input box otherwise). Lets the ~2 Hz caret blink avoid a full-window repaint,
    which was visible as a constant refresh on slow OS3 planar displays. */
