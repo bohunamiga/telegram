@@ -1699,7 +1699,8 @@ static unsigned long tg_gui_link_span(const char *text, unsigned long i,
         (n > 8UL && strncmp(text + i, "https://", 8) == 0) ||
         (n > 4UL && strncmp(text + i, "www.", 4) == 0)) {
         end = i;
-        while (end < length && text[end] != ' ' && text[end] != '\t') {
+        while (end < length && text[end] != ' ' && text[end] != '\t' &&
+               text[end] != '\n') {
             ++end;
         }
         while (end > i && (text[end - 1UL] == '.' || text[end - 1UL] == ',' ||
@@ -1714,6 +1715,22 @@ static unsigned long tg_gui_link_span(const char *text, unsigned long i,
     return 0UL;
 }
 
+/* A wrapped line or selection can start inside a URL. Keep the complete
+   word's context, so its literal markup characters still occupy pixels. */
+static unsigned long tg_gui_link_remaining(const char *text, unsigned long at,
+                                            unsigned long length)
+{
+    unsigned long start = at;
+    unsigned long end;
+
+    while (start > 0UL && text[start - 1UL] != ' ' &&
+           text[start - 1UL] != '\t' && text[start - 1UL] != '\n') {
+        --start;
+    }
+    end = start + tg_gui_link_span(text, start, length);
+    return end > at ? end - at : 0UL;
+}
+
 /* Draws one wrapped line of message text, interpreting the inline markup
    markers (* _ ` ~) as styling: each marker toggles a TG_GUI_STYLE_* bit, is
    not drawn itself, and the run between markers is drawn in the current style
@@ -1724,17 +1741,20 @@ static unsigned long tg_gui_link_span(const char *text, unsigned long i,
    unstyled. */
 static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                                int x, int baseline, const char *text,
-                               unsigned long length, int *style)
+                               unsigned long from, unsigned long length,
+                               int *style)
 {
-    unsigned long run_start = 0UL;
-    unsigned long link_left = 0UL; /* chars of the current link still to draw */
+    unsigned long run_start = from;
+    unsigned long text_length = (unsigned long)strlen(text);
+    unsigned long link_left = tg_gui_link_remaining(text, from, text_length);
+    unsigned long to = from + length;
     unsigned long i;
 
-    for (i = 0UL; i <= length; ++i) {
+    for (i = from; i <= to; ++i) {
         int toggle = 0;
         int boundary = 0;
 
-        if (i < length) {
+        if (i < to) {
             /* Markup markers are text INSIDE a link: an underscore in
                en.wikipedia.org/wiki/Amiga_500 is part of the address, not an
                italic switch. Reading it as markup dropped the byte from the
@@ -1756,8 +1776,9 @@ static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                 break;
             }
             if (link_left == 0UL &&
-                (i == 0UL || text[i - 1UL] == ' ' || text[i - 1UL] == '\t')) {
-                unsigned long span = tg_gui_link_span(text, i, length);
+                (i == 0UL || text[i - 1UL] == ' ' || text[i - 1UL] == '\t' ||
+                 text[i - 1UL] == '\n')) {
+                unsigned long span = tg_gui_link_span(text, i, text_length);
 
                 if (span > 0UL) {
                     link_left = span;
@@ -1765,7 +1786,7 @@ static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                 }
             }
         }
-        if (toggle != 0 || boundary || i == length) {
+        if (toggle != 0 || boundary || i == to) {
             if (i > run_start) {
                 if (backend->set_style != 0) {
                     backend->set_style(backend, link_left > 0UL && !boundary
@@ -1788,7 +1809,7 @@ static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                 run_start = i; /* link boundary: the run resumes here */
             }
         }
-        if (link_left > 0UL && i < length) {
+        if (link_left > 0UL && i < to) {
             --link_left;
             if (link_left == 0UL) {
                 /* Link ends AFTER this char: flush it in link style now. */
@@ -1975,16 +1996,17 @@ static void tg_gui_photo_geometry(const tg_gui_message *message,
     *out_h = h;
 }
 
-/* Width of text[0..len) AS RENDERED by tg_gui_draw_markup: the style marker
-   chars (* _ ` ~) are elided there and never advance x, so they must not be
-   measured either -- or the selection tint and the char-under-pointer mapping
-   drift right of the glyphs by one marker width each. Amiga font widths are
-   additive (no kerning), so summing the runs equals the drawn advance. */
+/* Width of text[from..to) as rendered: style markers occupy no pixels,
+   except inside URLs where they are literal text. The painter and pointer
+   mapping both retain URL context across wrapping and selection boundaries.
+   Amiga font widths are additive (no kerning), so runs sum to the advance. */
 static int tg_gui_marked_width(tg_gui_backend *backend, const char *text,
                                unsigned long from, unsigned long to)
 {
     unsigned long i;
     unsigned long run;
+    unsigned long length = (unsigned long)strlen(text);
+    unsigned long link_end = from + tg_gui_link_remaining(text, from, length);
     int w = 0;
 
     run = from;
@@ -1992,7 +2014,12 @@ static int tg_gui_marked_width(tg_gui_backend *backend, const char *text,
         int marker = 0;
 
         if (i < to) {
-            marker = (text[i] == '*' || text[i] == '_' || text[i] == '`' ||
+            if (i >= link_end && (i == 0UL || text[i - 1UL] == ' ' ||
+                                 text[i - 1UL] == '\t' || text[i - 1UL] == '\n')) {
+                link_end = i + tg_gui_link_span(text, i, length);
+            }
+            marker = i >= link_end &&
+                     (text[i] == '*' || text[i] == '_' || text[i] == '`' ||
                       text[i] == '~');
         }
         if (marker || i == to) {
@@ -2385,7 +2412,7 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
                                message->is_own ? TG_GUI_PEN_READ
                                                : TG_GUI_PEN_LINK,
                                bubble_x + pad, baseline,
-                               message->text + starts[k], lengths[k], &style);
+                               message->text, starts[k], lengths[k], &style);
         }
     }
     if (backend->set_style != 0) {
@@ -4536,6 +4563,11 @@ typedef struct tg_gui_record {
     const char *watch_text[5];
     int watch_y[5];
     int watch_hits[5];
+    const tg_gui_state *link_state;
+    const char *link_text;
+    unsigned long link_chars;
+    int link_msg;
+    int link_bad_hits;
     int avatar_images;
     int fills;
     int avatars;
@@ -4750,6 +4782,33 @@ static void tg_gui_rec_text(tg_gui_backend *backend, int pen, int x,
         record->first_text_y = baseline;
     }
     record->texts += 1;
+    if (record->link_text != 0 &&
+        (pen == TG_GUI_PEN_LINK || pen == TG_GUI_PEN_READ)) {
+        unsigned long i;
+
+        /* Exercise the click path from the actual drawn glyph coordinates,
+           including every continuation of a wrapped URL below its picture. */
+        for (i = 0UL; i < length; ++i) {
+            char url[TG_GUI_MSG_TEXT_MAX + 8];
+            int px = x + backend->text_width(backend, text, i) + 3;
+            int py = baseline - 2;
+            long ch = tg_gui_transcript_char_at(
+                record->link_state, backend, record->line_h,
+                record->link_msg, px, py);
+
+            if (record->link_chars >= strlen(record->link_text) ||
+                text[i] != record->link_text[record->link_chars] ||
+                tg_gui_hit_test(record->link_state, record->width,
+                                 record->height, record->line_h, px, py) !=
+                    TG_GUI_HIT_MESSAGE_BASE - record->link_msg ||
+                !tg_gui_url_at(&record->link_state->messages[record->link_msg],
+                                ch, url, sizeof(url)) ||
+                strcmp(url, record->link_text) != 0) {
+                ++record->link_bad_hits;
+            }
+            ++record->link_chars;
+        }
+    }
     for (w = 0; w < 5; ++w) {
         const char *watched = record->watch_text[w];
 
@@ -5013,6 +5072,80 @@ int tg_gui_self_test(void)
     backend.avatar_fill = tg_gui_rec_avatar;
     backend.draw_text = tg_gui_rec_text;
     backend.set_style = 0; /* recorder renders plain; markers are just skipped */
+    /* Literal URL punctuation must count towards the click target, even
+       when a photo, reply or sender band precedes the body. Narrow windows
+       force the URL across lines; emoji on/off changes the text line height. */
+    {
+        static tg_gui_state draft;
+        const char *url = "https://example.org/a_b*c~d_e*f~g_h*i~j_image.png";
+        int narrow;
+        int enabled;
+        int photos;
+        int kind;
+
+        for (narrow = 0; narrow <= 1; ++narrow) {
+            for (enabled = 0; enabled <= 1; ++enabled) {
+                for (photos = 0; photos <= 1; ++photos) {
+                    for (kind = 0; kind < 3; ++kind) {
+                        tg_gui_record rec;
+                        tg_gui_backend b = backend;
+                        tg_gui_message *m;
+                        int mi = kind == 2 ? 1 : 0;
+
+                        memset(&rec, 0, sizeof(rec));
+                        tg_gui_demo_state(&draft);
+                        memset(draft.messages, 0, sizeof(draft.messages));
+                        draft.message_count = mi + 1;
+                        draft.selected_msg = -1;
+                        draft.inline_photos = photos;
+                        draft.emoji_enabled = enabled;
+                        m = &draft.messages[mi];
+                        m->id = 2UL;
+                        m->is_own = kind == 1;
+                        strcpy(m->sender, "Example");
+                        strcpy(m->text, "*See* ");
+                        strcat(m->text, url);
+                        strcat(m->text, "\n[Link: Example - Image]\nDescription.");
+                        strcpy(m->reply_text, "Earlier message");
+                        m->has_photo = 1;
+                        m->photo_ready = 1;
+                        m->photo_width = 320UL;
+                        m->photo_height = 180UL;
+                        if (mi == 1) {
+                            draft.messages[0].id = 1UL;
+                            strcpy(draft.messages[0].sender, "Example");
+                            strcpy(draft.messages[0].text, "Earlier message");
+                        }
+                        rec.width = narrow ? 480 : 1280;
+                        rec.height = 720;
+                        rec.font_h = 8;
+                        rec.line_h = tg_gui_font_line_height(&draft, 8);
+                        rec.ascent = tg_gui_font_cell_ascent(&draft, 8, 6);
+                        rec.link_state = &draft;
+                        rec.link_msg = mi;
+                        rec.link_text = url;
+                        b.context = &rec;
+                        b.font_ascent = tg_gui_rec_ascent;
+                        b.font_height = tg_gui_rec_font_height;
+                        tg_gui_paint(&draft, &b);
+                        if (rec.link_bad_hits != 0 ||
+                            rec.link_chars != strlen(url)) {
+                            puts("gui self-test: drawn URL glyph did not open its link");
+                            return 2;
+                        }
+                        if (draft.photo_w[mi] <= 0 || draft.photo_h[mi] <= 0 ||
+                            tg_gui_hit_test(&draft, rec.width, rec.height,
+                                             rec.line_h, draft.photo_x[mi] + 2,
+                                             draft.photo_y[mi] + 2) !=
+                                TG_GUI_HIT_PHOTO_BASE - mi) {
+                            puts("gui self-test: URL click stole the picture target");
+                            return 2;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /* Every server-backed message exposes both forwarding actions. Pin the
        context-menu capacity and IDs so adding another conditional item cannot

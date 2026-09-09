@@ -49,6 +49,10 @@ unless noted.
   client's /photo all take .png alongside .jpg.
 
 ### Fixed
+- Clicking URL text keeps the pointer aligned with literal characters such
+  as underscores and tildes, including below a link preview. Wrapped URLs
+  keep their complete text and link styling across lines. Clicking the
+  preview picture still opens the image viewer.
 - Opening a photo's context menu or the Send photo dialog no longer freezes
   AfAOS while drawing its labels. Popup areas are copied from the completed
   buffer after photo replay, so menus, mentions and emoji stay above pictures
