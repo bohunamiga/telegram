@@ -964,9 +964,9 @@ static int tg_gui_centred_baseline(tg_gui_backend *backend, int box_y,
     return box_y + ((box_h - glyph_h) / 2) + ascent;
 }
 
-/* Avatars scale with the native font, never with the extra text spacing
-   reserved for emoji. Preserve the pre-emoji dimensions on each platform. */
-static int tg_gui_avatar_size(tg_gui_backend *backend, int header)
+/* Navigation uses native font metrics, independent of the larger emoji cell
+   reserved for messages and the composer. */
+static int tg_gui_native_line_height(tg_gui_backend *backend)
 {
     int h = backend->font_height != 0 ? backend->font_height(backend)
                                         : backend->line_height(backend) - 2;
@@ -974,7 +974,39 @@ static int tg_gui_avatar_size(tg_gui_backend *backend, int header)
     if (h <= 0) {
         h = 8;
     }
-    return 2 * (h + 2) - (header ? 2 : 0);
+    return h + 2;
+}
+
+int tg_gui_navigation_line_height(const tg_gui_state *state, int fallback)
+{
+    return state != 0 && state->nav_lh > 0 ? state->nav_lh : fallback;
+}
+
+static int tg_gui_navigation_baseline(tg_gui_backend *backend, int box_y,
+                                       int box_h)
+{
+    int native_h = tg_gui_native_line_height(backend) - 2;
+    int cell_h = backend->line_height(backend) - 2;
+    int ascent = native_h;
+
+    if (backend->font_ascent != 0) {
+        ascent = backend->font_ascent(backend);
+        if (cell_h > native_h) {
+            ascent -= (cell_h - native_h) / 2;
+        }
+        if (ascent <= 0 || ascent > native_h) {
+            ascent = native_h;
+        }
+    }
+    /* Centre the native letters first. Cancelling the virtual cell's padding
+       before dividing also avoids a one-pixel toggle jump with odd fonts. */
+    return box_y + (box_h - native_h) / 2 + ascent;
+}
+
+/* Preserve the pre-emoji avatar dimensions on each platform. */
+static int tg_gui_avatar_size(tg_gui_backend *backend, int header)
+{
+    return 2 * tg_gui_native_line_height(backend) - (header ? 2 : 0);
 }
 
 /* Left inset of a disc of diameter h at pixel row y. Doubled coordinates
@@ -1265,7 +1297,7 @@ int tg_gui_search_click_caret(const tg_gui_state *state,
         return -1;
     }
     width = backend->width(backend);
-    lh = backend->line_height(backend);
+    lh = tg_gui_native_line_height(backend);
     if (width <= 0 || lh <= 0) {
         return -1;
     }
@@ -1344,13 +1376,13 @@ static void tg_gui_paint_search_box(const tg_gui_state *state,
     int sbase;
 
     width = backend->width(backend);
-    lh = backend->line_height(backend);
+    lh = tg_gui_native_line_height(backend);
     if (width <= 0 || lh <= 0) {
         return;
     }
     sidebar_w = tg_gui_sidebar_w(width);
     search_h = lh + 10;
-    sbase = tg_gui_centred_baseline(backend, 0, search_h);
+    sbase = tg_gui_navigation_baseline(backend, 0, search_h);
     backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
                        tg_gui_make_rect(0, 0, sidebar_w, search_h));
     if (state->search_query[0] != '\0') {
@@ -1504,7 +1536,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 unsigned long ilen = (unsigned long)strlen(chat->initials);
                 int iw = backend->text_width(backend, chat->initials, ilen);
                 int ix = 8 + ((avatar - iw) / 2);
-                int iy = tg_gui_centred_baseline(backend, avatar_y, avatar);
+                int iy = tg_gui_navigation_baseline(backend, avatar_y, avatar);
 
                 if (ix < 8) {
                     ix = 8;
@@ -1520,7 +1552,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
             int badge_w;
             int badge_x;
             int has_preview;
-            int row_mid;
+            int slot_h;
             int name_baseline;
             int name_limit;
 
@@ -1531,13 +1563,12 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                per-chat fill) the row keeps the two-line name-over-preview
                layout with the time top-right. */
             has_preview = chat->preview[0] != '\0';
-            row_mid = y + 6 + lh; /* avatar centre == initials baseline */
-            /* Single line: drop the name a couple of pixels below the initials
-               baseline so it sits at the optical centre between the avatar and
-               badge bubbles (the bitmap-font descent makes a baseline-aligned
-               name read high). */
+            /* Two equal slots fit 16px emoji even with topaz 8, without growing
+               the row. Single-line names share the avatar's centre. */
+            slot_h = row_h / 2;
             name_baseline = has_preview
-                ? tg_gui_centred_baseline(backend, y + 4, lh) : (row_mid + 2);
+                ? tg_gui_navigation_baseline(backend, y, slot_h)
+                : tg_gui_navigation_baseline(backend, y, row_h);
 
             badge[0] = '\0';
             badge_w = 0;
@@ -1573,7 +1604,8 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 preview_limit = (chat->unread > 0) ? (badge_x - 4)
                                                    : (sidebar_w - 10);
                 tg_gui_draw_clipped(backend, preview_pen, text_x,
-                                    tg_gui_centred_baseline(backend, y + 8 + lh, lh),
+                                    tg_gui_navigation_baseline(backend, y + slot_h,
+                                                               slot_h),
                                     chat->preview,
                                     preview_limit - text_x);
             }
@@ -1586,8 +1618,8 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 /* Two-line: pill on the preview line. Single-line: pill centred
                    on the row middle, level with the name and avatar. The count
                    stays inside the fill either way. */
-                badge_top = has_preview ? ((y + 8 + (2 * lh)) - lh)
-                                        : (row_mid - (badge_h / 2));
+                badge_top = has_preview ? y + slot_h + (slot_h - badge_h) / 2
+                                        : y + (row_h - badge_h) / 2;
                 /* A chat that just got a notification draws its badge in the
                    accent pen to stand out; the live event loop toggles
                    chat->flash for a true blink. */
@@ -1604,7 +1636,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 /* Centred in the pill both ways: horizontally above, and
                    vertically from the font's own ascent. */
                 backend->draw_text(backend, TG_GUI_PEN_BADGE_TEXT, num_x,
-                                   tg_gui_centred_baseline(backend, badge_top,
+                                   tg_gui_navigation_baseline(backend, badge_top,
                                                            badge_h),
                                    badge, (unsigned long)strlen(badge));
             }
@@ -3293,7 +3325,7 @@ static void tg_gui_paint_main(const tg_gui_state *state,
         ((tg_gui_state *)state)->sel_press_char = -1;
     }
 
-    header_h = lh + 10;
+    header_h = 3 * tg_gui_native_line_height(backend) + 14;
     /* The open chat's avatar sits before the title, same drawing as its
        sidebar row (real image first, initials square as the fallback), so
        the header answers "which chat am I in" the way the desktop client
@@ -3301,12 +3333,14 @@ static void tg_gui_paint_main(const tg_gui_state *state,
        the login/cached states keep their plain layout. */
     {
         int text_x = area_x;
+        int slot_h = tg_gui_native_line_height(backend) + 6;
+        int text_top = (header_h - 2 * slot_h) / 2;
 
         if (state->selected_chat >= 0 &&
             state->selected_chat < state->chat_count) {
             const tg_gui_chat *open_chat = &state->chats[state->selected_chat];
             int av = tg_gui_avatar_size(backend, 1);
-            int av_y = 4 + ((2 * lh) - 2 - av) / 2;
+            int av_y = (header_h - av) / 2;
 
             backend->round_bg = TG_GUI_PEN_WINDOW;
             if (backend->avatar_image == 0 ||
@@ -3326,26 +3360,28 @@ static void tg_gui_paint_main(const tg_gui_state *state,
                         ix = area_x;
                     }
                     backend->draw_text(backend, TG_GUI_PEN_TEXT, ix,
-                                       tg_gui_centred_baseline(backend, av_y, av),
+                                       tg_gui_navigation_baseline(backend, av_y, av),
                                        open_chat->initials, ilen);
                 }
             }
             text_x = area_x + av + 8;
         }
         tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT, text_x,
-                            tg_gui_centred_baseline(backend, 2, lh),
+                            tg_gui_navigation_baseline(backend, text_top, slot_h),
                             state->title, area_w - (text_x - area_x));
         /* While the peer is typing, the second header line shows "X is
            typing..." in the accent colour instead of the static subtitle
            (Telegram's cue). */
         if (state->typing[0] != '\0') {
             tg_gui_draw_clipped(backend, TG_GUI_PEN_ACCENT, text_x,
-                                tg_gui_centred_baseline(backend, header_h - 2, lh),
+                                tg_gui_navigation_baseline(backend, text_top + slot_h,
+                                                           slot_h),
                                 state->typing,
                                 area_w - (text_x - area_x));
         } else {
             tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT_DIM, text_x,
-                                tg_gui_centred_baseline(backend, header_h - 2, lh),
+                                tg_gui_navigation_baseline(backend, text_top + slot_h,
+                                                           slot_h),
                                 state->subtitle,
                                 area_w - (text_x - area_x));
         }
@@ -3355,9 +3391,8 @@ static void tg_gui_paint_main(const tg_gui_state *state,
     ((tg_gui_state *)state)->input_h = input_h; /* cache for the hit-test */
     transcript_bottom = content_h - input_h - 4;
 
-    /* One full line below the subtitle baseline so the first incoming bubble's
-       sender name clears the header at any font size. */
-    y = header_h + (2 * lh) + 4;
+    /* Both header lines and their emoji fit above this stable boundary. */
+    y = header_h;
     transcript_top = y;
     /* Pixel-granular transcript scroll: transcript_scroll is a PIXEL offset up
        from the newest-pinned position (0 = newest pinned to the bottom). This
@@ -3549,6 +3584,7 @@ int tg_gui_chat_drop_target(const tg_gui_state *state, int lh, int y)
     if (state == 0) {
         return 0;
     }
+    lh = tg_gui_navigation_line_height(state, lh);
     search_h = lh + 10;       /* keep in sync with tg_gui_paint_sidebar */
     row_h = (2 * lh) + 12;
     if (row_h < 1) {
@@ -3813,9 +3849,10 @@ int tg_gui_hit_test(const tg_gui_state *state, int width, int height, int lh,
     if (x >= 0 && x < sidebar_w && y >= 0 && y < content_h) {
         int search_h;
         int row_h;
+        int nav_lh = tg_gui_navigation_line_height(state, lh);
 
-        search_h = lh + 10;
-        row_h = (2 * lh) + 12;
+        search_h = nav_lh + 10;
+        row_h = (2 * nav_lh) + 12;
         if (y >= search_h) {
             int row;
 
@@ -4479,7 +4516,8 @@ void tg_gui_paint(const tg_gui_state *state, tg_gui_backend *backend)
     if (!tg_gui_first_paint_logged) {
         tg_gui_log("chat paint: sidebar");
     }
-    tg_gui_paint_sidebar(state, backend, sidebar_w, content_h, lh);
+    ((tg_gui_state *)state)->nav_lh = tg_gui_native_line_height(backend);
+    tg_gui_paint_sidebar(state, backend, sidebar_w, content_h, state->nav_lh);
     if (!tg_gui_first_paint_logged) {
         tg_gui_log("chat paint: main");
     }
@@ -4513,7 +4551,11 @@ typedef struct tg_gui_record {
     int first_text_x;
     int first_text_y;
     tg_gui_rect first_avatar;
+    tg_gui_rect second_avatar;
     tg_gui_rect last_avatar;
+    const char *watch_text[5];
+    int watch_y[5];
+    int watch_hits[5];
     int avatar_images;
     int fills;
     int avatars;
@@ -4635,6 +4677,8 @@ static void tg_gui_rec_avatar(tg_gui_backend *backend, int color_index,
     record = (tg_gui_record *)backend->context;
     if (record->avatars == 0) {
         record->first_avatar = rect;
+    } else if (record->avatars == 1) {
+        record->second_avatar = rect;
     }
     record->last_avatar = rect;
     record->avatars += 1;
@@ -4694,6 +4738,7 @@ static void tg_gui_rec_text(tg_gui_backend *backend, int pen, int x,
                             unsigned long length)
 {
     tg_gui_record *record;
+    int w;
 
     (void)pen;
     record = (tg_gui_record *)backend->context;
@@ -4702,6 +4747,15 @@ static void tg_gui_rec_text(tg_gui_backend *backend, int pen, int x,
         record->first_text_y = baseline;
     }
     record->texts += 1;
+    for (w = 0; w < 5; ++w) {
+        const char *watched = record->watch_text[w];
+
+        if (watched != 0 && length == (unsigned long)strlen(watched) &&
+            memcmp(text, watched, length) == 0) {
+            record->watch_y[w] = baseline;
+            ++record->watch_hits[w];
+        }
+    }
     /* The read receipt is no longer text -- it is drawn as ticks in the READ pen
        and counted in tg_gui_rec_fill. */
     /* Guard that a forbidden string (a masked password) never reaches draw. */
@@ -5526,13 +5580,18 @@ int tg_gui_self_test(void)
         }
     }
 
-    /* Regression: emoji spacing must not resize real avatars or the initials
-       fallback. Exercise the actual sidebar and header paint at OS3 resolution. */
+    /* Emoji spacing must not resize avatars, rows or the open-chat header.
+       Record the actual painter at OS3 resolution, including odd native fonts,
+       initials/photos, single/two-line rows and both subtitle/typing paths. */
     {
-        static const int fonts[][4] = {
-            /* native height/baseline, sidebar diameter, header diameter */
-            {8, 6, 20, 18}, {9, 6, 22, 20}, {12, 9, 28, 26},
-            {16, 11, 36, 34}, {24, 18, 52, 50}
+        static const int fonts[][11] = {
+            /* native height/baseline, avatar diameters, search/row/header heights,
+               then search/name/single-line/title baselines */
+            {8, 6, 20, 18, 20, 32, 44, 12, 30, 70, 16},
+            {9, 6, 22, 20, 21, 34, 47, 12, 31, 73, 16},
+            {12, 9, 28, 26, 24, 40, 56, 15, 37, 87, 21},
+            {16, 11, 36, 34, 28, 48, 68, 17, 43, 103, 25},
+            {24, 18, 52, 50, 36, 64, 92, 24, 58, 138, 36}
         };
         static tg_gui_state draft;
         unsigned long f;
@@ -5544,9 +5603,20 @@ int tg_gui_self_test(void)
                 for (images = 0; images <= 1; ++images) {
                     tg_gui_record rec;
                     tg_gui_backend b = backend;
+                    int w;
 
                     tg_gui_demo_state(&draft);
                     tg_gui_set_emoji_enabled(&draft, enabled);
+                    strcpy(draft.chats[0].name, "Row name \x80!");
+                    strcpy(draft.chats[0].preview, "Preview \x80!");
+                    strcpy(draft.chats[1].name, "Single \x80!");
+                    draft.chats[1].preview[0] = '\0';
+                    strcpy(draft.title, "Header title \x80!");
+                    strcpy(draft.subtitle, "Header subtitle \x80!");
+                    if (images) {
+                        strcpy(draft.typing, "Header typing \x80!");
+                    }
+                    draft.more_above = 1; /* ensure a transcript scrollbar */
                     memset(&rec, 0, sizeof(rec));
                     rec.width = 1280;
                     rec.height = 720;
@@ -5554,6 +5624,11 @@ int tg_gui_self_test(void)
                     rec.line_h = tg_gui_font_line_height(&draft, rec.font_h);
                     rec.ascent = tg_gui_font_cell_ascent(
                         &draft, rec.font_h, fonts[f][1]);
+                    rec.watch_text[0] = draft.chats[0].name;
+                    rec.watch_text[1] = draft.chats[0].preview;
+                    rec.watch_text[2] = draft.chats[1].name;
+                    rec.watch_text[3] = draft.title;
+                    rec.watch_text[4] = images ? draft.typing : draft.subtitle;
                     b.context = &rec;
                     b.font_height = tg_gui_rec_font_height;
                     b.font_ascent = tg_gui_rec_ascent;
@@ -5577,16 +5652,114 @@ int tg_gui_self_test(void)
                         return 2;
                     }
                     if (2 * rec.first_avatar.y + rec.first_avatar.h !=
-                        2 * (rec.line_h + 10) + 2 * rec.line_h + 12) {
+                        2 * fonts[f][4] + fonts[f][5]) {
                         puts("gui self-test: sidebar avatar left the row centre");
                         return 2;
                     }
-                    if (2 * rec.last_avatar.y + rec.last_avatar.h !=
-                        8 + 2 * rec.line_h - 2) {
+                    if (rec.last_avatar.y != (fonts[f][6] - fonts[f][3]) / 2) {
                         puts("gui self-test: header avatar left the header centre");
                         return 2;
                     }
+                    if (rec.second_avatar.y - rec.first_avatar.y != fonts[f][5]) {
+                        puts("gui self-test: emoji setting expanded chat rows");
+                        return 2;
+                    }
+                    if (draft.sb_tr_max <= 0 || draft.sb_tr_ty != fonts[f][6]) {
+                        puts("gui self-test: emoji setting expanded the chat header");
+                        return 2;
+                    }
+                    for (w = 0; w < 5; ++w) {
+                        if (rec.watch_hits[w] != 1) {
+                            puts("gui self-test: navigation labels were not painted");
+                            return 2;
+                        }
+                    }
+                    if (enabled) {
+                        int cell = tg_gui_emoji_inline_size(&draft, rec.font_h);
+                        int name_top = rec.watch_y[0] - rec.ascent;
+                        int preview_top = rec.watch_y[1] - rec.ascent;
+                        int title_top = rec.watch_y[3] - rec.ascent;
+                        int subtitle_top = rec.watch_y[4] - rec.ascent;
+
+                        /* The native draw_text places each encoded emoji at
+                           baseline - cell ascent. Both 16px pictures must fit
+                           inside the real row/header and clear each other. */
+                        if (name_top < fonts[f][4] ||
+                            name_top + cell > preview_top ||
+                            preview_top + cell > fonts[f][4] + fonts[f][5] ||
+                            title_top < 0 || title_top + cell > subtitle_top ||
+                            subtitle_top + cell > draft.sb_tr_ty) {
+                            puts("gui self-test: navigation emoji escaped compact rows");
+                            return 2;
+                        }
+                    }
+                    if (rec.first_text_y != fonts[f][7] ||
+                        rec.watch_y[0] != fonts[f][8] ||
+                        rec.watch_y[1] != fonts[f][8] + fonts[f][5] / 2 ||
+                        rec.watch_y[2] != fonts[f][9] ||
+                        rec.watch_y[3] != fonts[f][10] ||
+                        rec.watch_y[4] != fonts[f][10] + fonts[f][5] / 2) {
+                        puts("gui self-test: navigation text moved with emoji spacing");
+                        return 2;
+                    }
+                    if (tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4] - 1) != TG_GUI_HIT_SEARCH ||
+                        tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4]) != 0 ||
+                        tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4] + fonts[f][5] - 1) != 0 ||
+                        tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4] + fonts[f][5]) != 1) {
+                        puts("gui self-test: chat clicks missed compact rows");
+                        return 2;
+                    }
+                    if (tg_gui_search_click_caret(&draft, &b, 12,
+                                                  fonts[f][4] - 1) != 0 ||
+                        tg_gui_search_click_caret(&draft, &b, 12,
+                                                  fonts[f][4]) != -1) {
+                        puts("gui self-test: search click entered a chat row");
+                        return 2;
+                    }
+                    if (tg_gui_chat_drop_target(&draft, rec.line_h,
+                            fonts[f][4] + fonts[f][5] / 2 - 1) != 0 ||
+                        tg_gui_chat_drop_target(&draft, rec.line_h,
+                            fonts[f][4] + fonts[f][5] / 2) != 1) {
+                        puts("gui self-test: chat reorder missed compact row gaps");
+                        return 2;
+                    }
                 }
+            }
+        }
+        /* A scrolled list must use the same row pitch for its knob, hits and
+           drops. Toggle the same state, as the live Settings menu does. */
+        tg_gui_demo_state(&draft);
+        for (enabled = draft.chat_count; enabled < TG_GUI_MAX_CHATS; ++enabled) {
+            draft.chats[enabled] = draft.chats[4];
+        }
+        draft.chat_count = TG_GUI_MAX_CHATS;
+        draft.chat_scroll = 3;
+        for (enabled = 0; enabled <= 1; ++enabled) {
+            tg_gui_record rec;
+            tg_gui_backend b = backend;
+
+            memset(&rec, 0, sizeof(rec));
+            tg_gui_set_emoji_enabled(&draft, enabled);
+            rec.width = 1280;
+            rec.height = 720;
+            rec.font_h = 8;
+            rec.line_h = tg_gui_font_line_height(&draft, 8);
+            rec.ascent = tg_gui_font_cell_ascent(&draft, 8, 6);
+            b.context = &rec;
+            b.font_height = tg_gui_rec_font_height;
+            b.font_ascent = tg_gui_rec_ascent;
+            tg_gui_paint(&draft, &b);
+            if (draft.sb_list_ty != 20 ||
+                draft.sb_list_max != TG_GUI_MAX_CHATS - 21 ||
+                rec.avatars != 22 || draft.chat_scroll != 3 ||
+                tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12, 52) != 4 ||
+                tg_gui_chat_drop_target(&draft, rec.line_h, 84) != 5) {
+                puts("gui self-test: scrolled list lost compact navigation geometry");
+                return 2;
             }
         }
     }

@@ -50,8 +50,10 @@ unless noted.
 
 ### Fixed
 - Toggling emoji no longer resizes avatars in the chat list or header.
-  Their dimensions follow the native font and they stay centred when the
-  text rows make room for emoji. This also covers avatars shown as initials.
+  The search field, chat rows and open-chat header keep their compact native
+  font dimensions too, with centred text and avatars, including initials.
+  Names and previews still fit graphical emoji; clicks, scrolling and row
+  reordering follow the same compact layout.
 - Composer text, caret and selection use the font's real baseline, correcting
   the low text position with taller MorphOS fonts. The Send label stays
   centred when the composer wraps onto several lines.

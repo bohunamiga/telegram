@@ -256,6 +256,7 @@ typedef struct tg_gui_state {
     int chat_scroll_to_sel; /* one-shot: next paint scrolls the list to selected_chat */
     int transcript_scroll; /* PIXELS scrolled up from the newest-pinned bottom (0 = newest) */
     int input_h;           /* composer box height (px), cached by the painter for the hit-test */
+    int nav_lh;            /* native font + leading, cached for sidebar mouse geometry */
     int inline_photos;     /* resolved GUI preference for this run */
     int inline_photos_explicit; /* user saved an on/off choice */
     int inline_photos_default_resolved; /* hardware default sampled this run */
@@ -729,6 +730,10 @@ int tg_gui_photo_preview_prepare_all(int count,
    nearest gap. Shared by the event loop (on drop) and the painter (insertion line)
    so they never disagree. */
 int tg_gui_chat_drop_target(const tg_gui_state *state, int lh, int y);
+
+/* Sidebar/header metric from the last paint, independent of emoji message
+   spacing. Before the first paint, use the caller's line-height fallback. */
+int tg_gui_navigation_line_height(const tg_gui_state *state, int fallback);
 
 /* The sidebar (chat-list) width for a window width -- shared with the event
    loop so a mouse-wheel can tell which panel the pointer is over. */

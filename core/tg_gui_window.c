@@ -10768,7 +10768,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                        painter redraws the insertion line. Gated on drag_src>=0 so
                        idle pointer motion (REPORTMOUSE is on) never reorders. */
                     int hy = (int)mouse_y - ctx.origin_y;
-                    int thresh = ((2 * ctx.line_h) + 12) / 2;
+                    int thresh = tg_gui_navigation_line_height(state, ctx.line_h) + 6;
 
                     state->drag_cur_y = hy;
                     if (!state->drag_active) {
