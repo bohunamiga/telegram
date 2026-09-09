@@ -87,6 +87,10 @@ struct tg_gui_backend {
        centred inside a taller emoji cell; caret/selection use that same cell.
        NULL falls back to the old approximation. */
     int (*font_ascent)(tg_gui_backend *backend);
+    /* OPTIONAL: native font height, without emoji padding. Avatar dimensions
+       follow this metric so changing text spacing does not resize them.
+       NULL falls back to line_height minus the normal two-pixel leading. */
+    int (*font_height)(tg_gui_backend *backend);
     /* OPTIONAL: draw the peer's real avatar (decoded stripped thumb) into rect.
        Returns 1 when it drew, 0 to make the renderer fall back to the classic
        initials square. NULL on backends without image support (host tests). */

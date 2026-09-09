@@ -964,6 +964,19 @@ static int tg_gui_centred_baseline(tg_gui_backend *backend, int box_y,
     return box_y + ((box_h - glyph_h) / 2) + ascent;
 }
 
+/* Avatars scale with the native font, never with the extra text spacing
+   reserved for emoji. Preserve the pre-emoji dimensions on each platform. */
+static int tg_gui_avatar_size(tg_gui_backend *backend, int header)
+{
+    int h = backend->font_height != 0 ? backend->font_height(backend)
+                                        : backend->line_height(backend) - 2;
+
+    if (h <= 0) {
+        h = 8;
+    }
+    return 2 * (h + 2) - (header ? 2 : 0);
+}
+
 /* Left inset of a disc of diameter h at pixel row y. Doubled coordinates
    keep the arithmetic integral: the row's centre sits at 2*y+1 of 2*h, and
    the loop is a tiny integer square root (h is a couple of text lines at
@@ -1436,6 +1449,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
          i < state->chat_count && y + row_h <= content_h; ++i) {
         const tg_gui_chat *chat;
         int avatar;
+        int avatar_y;
         int text_x;
         int name_pen;
         int preview_pen;
@@ -1462,7 +1476,8 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                                tg_gui_make_rect(0, y, sidebar_w, row_h));
         }
 
-        avatar = (2 * lh);
+        avatar = tg_gui_avatar_size(backend, 0);
+        avatar_y = y + (row_h - avatar) / 2;
         /* The background this row painted under its round chrome: the edge
            smoothing must blend toward it, or the ring reads as a halo. */
         backend->round_bg =
@@ -1476,10 +1491,10 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
         if (backend->avatar_image == 0 ||
             !backend->avatar_image(backend, chat->peer_id_hi,
                                    chat->peer_id_lo,
-                                   tg_gui_make_rect(8, y + 6, avatar,
+                                   tg_gui_make_rect(8, avatar_y, avatar,
                                                     avatar))) {
             backend->avatar_fill(backend, chat->avatar_color,
-                                 tg_gui_make_rect(8, y + 6, avatar, avatar));
+                                 tg_gui_make_rect(8, avatar_y, avatar, avatar));
             /* Centre the initials in the circle: measured width across, and
                the shared centred baseline down. The old hand-tuned formula
                (half a cell below the middle, minus a guessed descent) was
@@ -1489,7 +1504,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 unsigned long ilen = (unsigned long)strlen(chat->initials);
                 int iw = backend->text_width(backend, chat->initials, ilen);
                 int ix = 8 + ((avatar - iw) / 2);
-                int iy = tg_gui_centred_baseline(backend, y + 6, avatar);
+                int iy = tg_gui_centred_baseline(backend, avatar_y, avatar);
 
                 if (ix < 8) {
                     ix = 8;
@@ -3290,15 +3305,16 @@ static void tg_gui_paint_main(const tg_gui_state *state,
         if (state->selected_chat >= 0 &&
             state->selected_chat < state->chat_count) {
             const tg_gui_chat *open_chat = &state->chats[state->selected_chat];
-            int av = (2 * lh) - 2;
+            int av = tg_gui_avatar_size(backend, 1);
+            int av_y = 4 + ((2 * lh) - 2 - av) / 2;
 
             backend->round_bg = TG_GUI_PEN_WINDOW;
             if (backend->avatar_image == 0 ||
                 !backend->avatar_image(backend, open_chat->peer_id_hi,
                                        open_chat->peer_id_lo,
-                                       tg_gui_make_rect(area_x, 4, av, av))) {
+                                       tg_gui_make_rect(area_x, av_y, av, av))) {
                 backend->avatar_fill(backend, open_chat->avatar_color,
-                                     tg_gui_make_rect(area_x, 4, av, av));
+                                     tg_gui_make_rect(area_x, av_y, av, av));
                 {
                     unsigned long ilen =
                         (unsigned long)strlen(open_chat->initials);
@@ -3310,7 +3326,7 @@ static void tg_gui_paint_main(const tg_gui_state *state,
                         ix = area_x;
                     }
                     backend->draw_text(backend, TG_GUI_PEN_TEXT, ix,
-                                       tg_gui_centred_baseline(backend, 4, av),
+                                       tg_gui_centred_baseline(backend, av_y, av),
                                        open_chat->initials, ilen);
                 }
             }
@@ -4493,8 +4509,12 @@ typedef struct tg_gui_record {
     int height;
     int line_h;
     int ascent;
+    int font_h;
     int first_text_x;
     int first_text_y;
+    tg_gui_rect first_avatar;
+    tg_gui_rect last_avatar;
+    int avatar_images;
     int fills;
     int avatars;
     int photos;
@@ -4536,6 +4556,11 @@ static int tg_gui_rec_line_height(tg_gui_backend *backend)
 static int tg_gui_rec_ascent(tg_gui_backend *backend)
 {
     return ((tg_gui_record *)backend->context)->ascent;
+}
+
+static int tg_gui_rec_font_height(tg_gui_backend *backend)
+{
+    return ((tg_gui_record *)backend->context)->font_h;
 }
 
 #define TG_GUI_REC_EMOJI_CELL 12
@@ -4608,9 +4633,26 @@ static void tg_gui_rec_avatar(tg_gui_backend *backend, int color_index,
 
     (void)color_index;
     record = (tg_gui_record *)backend->context;
+    if (record->avatars == 0) {
+        record->first_avatar = rect;
+    }
+    record->last_avatar = rect;
     record->avatars += 1;
     tg_gui_rec_track(record, rect.x, rect.y);
     tg_gui_rec_track(record, rect.x + rect.w, rect.y + rect.h);
+}
+
+static int tg_gui_rec_avatar_image(tg_gui_backend *backend,
+                                   unsigned long peer_id_hi,
+                                   unsigned long peer_id_lo, tg_gui_rect rect)
+{
+    tg_gui_record *record = (tg_gui_record *)backend->context;
+
+    (void)peer_id_hi;
+    (void)peer_id_lo;
+    record->avatar_images += 1;
+    tg_gui_rec_avatar(backend, 0, rect);
+    return 1;
 }
 
 static int tg_gui_rec_photo(tg_gui_backend *backend,
@@ -4714,6 +4756,7 @@ int tg_gui_self_test(void)
     backend.height = tg_gui_rec_height;
     backend.line_height = tg_gui_rec_line_height;
     backend.font_ascent = 0; /* recorder: exercise the renderer's fallback */
+    backend.font_height = 0;
     backend.text_width = tg_gui_rec_text_width;
     backend.glyph_image = tg_gui_rec_glyph;
     backend.fill_rect = tg_gui_rec_fill;
@@ -5480,6 +5523,71 @@ int tg_gui_self_test(void)
             tg_gui_attachment_is_photo(0)) {
             puts("gui self-test: attachment photo/file choice mismatch");
             return 2;
+        }
+    }
+
+    /* Regression: emoji spacing must not resize real avatars or the initials
+       fallback. Exercise the actual sidebar and header paint at OS3 resolution. */
+    {
+        static const int fonts[][4] = {
+            /* native height/baseline, sidebar diameter, header diameter */
+            {8, 6, 20, 18}, {9, 6, 22, 20}, {12, 9, 28, 26},
+            {16, 11, 36, 34}, {24, 18, 52, 50}
+        };
+        static tg_gui_state draft;
+        unsigned long f;
+        int enabled;
+        int images;
+
+        for (f = 0; f < sizeof(fonts) / sizeof(fonts[0]); ++f) {
+            for (enabled = 0; enabled <= 1; ++enabled) {
+                for (images = 0; images <= 1; ++images) {
+                    tg_gui_record rec;
+                    tg_gui_backend b = backend;
+
+                    tg_gui_demo_state(&draft);
+                    tg_gui_set_emoji_enabled(&draft, enabled);
+                    memset(&rec, 0, sizeof(rec));
+                    rec.width = 1280;
+                    rec.height = 720;
+                    rec.font_h = fonts[f][0];
+                    rec.line_h = tg_gui_font_line_height(&draft, rec.font_h);
+                    rec.ascent = tg_gui_font_cell_ascent(
+                        &draft, rec.font_h, fonts[f][1]);
+                    b.context = &rec;
+                    b.font_height = tg_gui_rec_font_height;
+                    b.font_ascent = tg_gui_rec_ascent;
+                    b.avatar_image = images ? tg_gui_rec_avatar_image : 0;
+                    tg_gui_paint(&draft, &b);
+                    if (rec.avatars != draft.chat_count + 1 ||
+                        rec.avatar_images != (images ? rec.avatars : 0)) {
+                        puts("gui self-test: avatar paths were not painted");
+                        return 2;
+                    }
+                    if (rec.first_avatar.w != fonts[f][2] ||
+                        rec.first_avatar.h != fonts[f][2] ||
+                        rec.first_avatar.x != 8) {
+                        puts("gui self-test: emoji setting resized sidebar avatars");
+                        return 2;
+                    }
+                    if (rec.last_avatar.w != fonts[f][3] ||
+                        rec.last_avatar.h != fonts[f][3] ||
+                        rec.last_avatar.x != tg_gui_sidebar_w(1280) + 12) {
+                        puts("gui self-test: emoji setting resized the header avatar");
+                        return 2;
+                    }
+                    if (2 * rec.first_avatar.y + rec.first_avatar.h !=
+                        2 * (rec.line_h + 10) + 2 * rec.line_h + 12) {
+                        puts("gui self-test: sidebar avatar left the row centre");
+                        return 2;
+                    }
+                    if (2 * rec.last_avatar.y + rec.last_avatar.h !=
+                        8 + 2 * rec.line_h - 2) {
+                        puts("gui self-test: header avatar left the header centre");
+                        return 2;
+                    }
+                }
+            }
         }
     }
 

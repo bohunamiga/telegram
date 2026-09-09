@@ -49,6 +49,9 @@ unless noted.
   client's /photo all take .png alongside .jpg.
 
 ### Fixed
+- Toggling emoji no longer resizes avatars in the chat list or header.
+  Their dimensions follow the native font and they stay centred when the
+  text rows make room for emoji. This also covers avatars shown as initials.
 - Composer text, caret and selection use the font's real baseline, correcting
   the low text position with taller MorphOS fonts. The Send label stays
   centred when the composer wraps onto several lines.

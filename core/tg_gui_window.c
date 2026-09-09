@@ -594,6 +594,14 @@ static int tg_gui_amiga_line_height(tg_gui_backend *backend)
     return ((tg_gui_amiga_ctx *)backend->context)->line_h;
 }
 
+static int tg_gui_amiga_font_height(tg_gui_backend *backend)
+{
+    const tg_gui_amiga_ctx *ctx = (const tg_gui_amiga_ctx *)backend->context;
+
+    return ctx != 0 && ctx->rport != 0 && ctx->rport->Font != 0
+               ? (int)ctx->rport->Font->tf_YSize : 8;
+}
+
 /* The font stays native; its baseline is centred in a taller layout cell
    when small-font text shares a line with a graphical emoji. */
 static int tg_gui_amiga_font_ascent(tg_gui_backend *backend)
@@ -8366,6 +8374,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
     backend.height = tg_gui_amiga_height;
     backend.line_height = tg_gui_amiga_line_height;
     backend.font_ascent = tg_gui_amiga_font_ascent;
+    backend.font_height = tg_gui_amiga_font_height;
     backend.text_width = tg_gui_amiga_text_width;
     backend.fill_rect = tg_gui_amiga_fill_rect;
     backend.avatar_fill = tg_gui_amiga_avatar_fill;

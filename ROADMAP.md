@@ -631,7 +631,9 @@ codepoint the sheet knows, and the backends draw them inside the text
 runs. With emoji enabled the cell is now at least sixteen pixels, even on
 OS3 with Topaz 8: the font stays unchanged, and the line metrics reserve room
 for the glyph and centre the smaller letters beside it. Resolution does not
-decide whether an emoji becomes a picture. "Settings > Enable emoji"
+decide whether an emoji becomes a picture. Avatars keep their native-font
+dimensions when this spacing changes, in both the chat list and the header.
+"Settings > Enable emoji"
 turns off the picker, its composer button and graphical text rendering,
 leaving text emoticons and any already-entered emoji intact. Its saved choice
 is independent of photos. Both features default off on native AGA/ECS/OCS
