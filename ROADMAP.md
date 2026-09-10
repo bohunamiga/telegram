@@ -803,6 +803,47 @@ can be requested, which also explains the silence that follows too many
 attempts. The manuals' first-start section gets the same sentence, so
 the answer arrives before the question.
 
+## Planned: sign in by QR code, so no code has to arrive at all
+
+Every login problem this project has had has the same shape: the client
+asks Telegram for a code, Telegram says it sent one, and the user never
+sees it. It has happened to two different people now, on two different
+systems, and neither case was a bug in the request. One was a service
+chat nobody thought to look in; the other was an account that Telegram
+wanted to set up a login email for before it would send anything. The
+client can say all of this now, and it does, but saying it is not the
+same as not needing it.
+
+Telegram has a login route that skips the code completely, and it is the
+one its own desktop client offers first. `auth.exportLoginToken` returns
+a token that lasts about thirty seconds; the client renders
+`tg://login?token=<base64url>` as a QR code; the user points an
+already-signed-in phone at the screen and confirms; `updateLoginToken`
+arrives, the client calls export again and gets `auth.loginTokenSuccess`,
+or `auth.loginTokenMigrateTo` and then `auth.importLoginToken` on the
+datacenter it names. Two-step verification still asks for its password
+afterwards, as it does today.
+
+For a retro machine the drawing is the easy half: a QR code is a grid of
+black and white squares, which is the cheapest thing this renderer can
+put on a screen, and it works on a plain AGA display as well as on RTG.
+The work is a QR encoder and the token exchange, and the reward is a
+first login that cannot fail because a message did not arrive. The
+existing code path stays: a phone that cannot scan, or a user who
+prefers typing, still gets the number and the code.
+
+## Planned: the api credentials the packages carry
+
+Every package ships the same api_id and api_hash in a plain text file, so
+that the client works the moment it is unpacked. That convenience has two
+costs. The credentials are published, which is the one thing Telegram's
+terms tell developers not to do with them, and everybody shares one set
+of limits. The default pair belongs in the binary instead, with
+`data/telegram-api.txt` kept as the override for anyone who wants their
+own; the file stops being part of what we distribute, and a new pair can
+be rolled out with a release. The pair itself should belong to the
+project rather than to a personal account.
+
 ## Open: one crash on AROS x86_64, in idle, not reproduced
 
 Seen once during the 0.0.92 field test, on 2026-09-02, in the AROS One
