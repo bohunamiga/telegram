@@ -49,6 +49,14 @@ unless noted.
   client's /photo all take .png alongside .jpg.
 
 ### Fixed
+- The login screen no longer promises a code Telegram is not sending. One
+  delivery answer means "add and verify a login email first", and it used to
+  read like any other, so a first user waited for a message that could never
+  arrive. That case now says what the account needs, and a delivery type this
+  build does not recognise says so instead of pretending, with its number in
+  the console and in the debug log. The log also records the delivery route
+  and the digit count next to "send_code done", so a login that receives
+  nothing can be diagnosed from the log alone.
 - Clicking URL text keeps the pointer aligned with literal characters such
   as underscores and tildes, including below a link preview. Wrapped URLs
   keep their complete text and link styling across lines. Clicking the

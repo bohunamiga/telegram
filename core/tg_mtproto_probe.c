@@ -1896,10 +1896,21 @@ static const char *tg_mtproto_sent_code_text(unsigned long type_constructor,
     case 0xf450f59bUL: /* auth.sentCodeTypeEmailCode */
         return brief ? "Code sent to your email"
                      : "Check your email for the code.";
+    case 0xa5491deaUL: /* auth.sentCodeTypeSetUpEmailRequired */
+        /* Telegram sends NOTHING here: the account must add and verify a
+           login email before it will hand out codes again. A field report
+           (AROS, 0.0.92) waited for a code that was never coming, because
+           this answer used to fall into the default below and read like any
+           other "enter the code". */
+        return brief ? "Telegram wants a login email first"
+                     : "No code is coming: Telegram wants this account to add"
+                       " and verify a login email. Do that once in an official"
+                       " Telegram app, then sign in here again.";
     default:
-        /* Unknown delivery type: the GUI still needs a prompt, the console
-           stays silent rather than mislead. */
-        return brief ? "Enter the code you received" : 0;
+        /* A delivery type this build does not know. Say so: pretending a
+           code is on its way is what wasted a tester's afternoon. The
+           console prints the constructor as well, from the caller. */
+        return brief ? "Telegram did not say where it sent the code" : 0;
     }
 }
 
@@ -1913,6 +1924,10 @@ static void tg_mtproto_print_login_code_hint(FILE *stream,
     }
     hint = tg_mtproto_sent_code_text(type_constructor, 0);
     if (hint == 0) {
+        /* Unknown type: the number is the only useful thing we have, and it
+           is what turns "no code arrived" into a five minute diagnosis. */
+        fprintf(stream, "Telegram did not say where it sent the code"
+                        " (delivery type 0x%08lx).\n", type_constructor);
         return;
     }
     fprintf(stream, "%s\n", hint);
@@ -14064,6 +14079,7 @@ static int tg_gui_hidden_projection_self_test(void);
 #if !defined(TG_NO_SELFTEST)
 static int tg_mtproto_executable_sniff_self_test(void); /* defined by the download engine */
 static int tg_mtproto_photo_gate_self_test(void);       /* defined by the upload engine */
+static int tg_mtproto_sent_code_text_self_test(void);   /* defined with the login texts */
 #endif
 
 int tg_mtproto_probe_self_test(void)
@@ -14507,6 +14523,9 @@ int tg_mtproto_probe_self_test(void)
         return 2;
     }
     if (tg_mtproto_photo_gate_self_test() != 0) {
+        return 2;
+    }
+    if (tg_mtproto_sent_code_text_self_test() != 0) {
         return 2;
     }
     if (tg_gui_hidden_projection_self_test() != 0) {
@@ -17313,6 +17332,49 @@ static const char *tg_mtproto_upload_failure_text(const char *raw)
 /* Host-runnable: the gate says yes to a whole JPEG and a whole PNG, no to a
    truncated one of each, no to a PNG Telegram would refuse for its size, and
    no to plain text, each with the sentence a status line will show. */
+/* Every auth.SentCodeType Telegram documents must map to a sentence, and the
+   one that means "no code is coming" must not read like the others. Checked
+   against core.telegram.org/type/auth.SentCodeType (2026-09-10). */
+static int tg_mtproto_sent_code_text_self_test(void)
+{
+    static const unsigned long known[] = {
+        0x3dbb5986UL, /* app */
+        0xc000bba2UL, /* sms */
+        0x5353e5a7UL, /* call */
+        0xab03c6d9UL, /* flashCall */
+        0x82006484UL, /* missedCall */
+        0xf450f59bUL, /* emailCode */
+        0xa5491deaUL, /* setUpEmailRequired */
+        0xd9565c39UL, /* fragmentSms */
+        0x009fd736UL, /* firebaseSms */
+        0xa416ac81UL, /* smsWord */
+        0xb37794afUL  /* smsPhrase */
+    };
+    unsigned long i;
+
+    for (i = 0UL; i < sizeof(known) / sizeof(known[0]); ++i) {
+        if (tg_mtproto_sent_code_text(known[i], 0) == 0 ||
+            tg_mtproto_sent_code_text(known[i], 1) == 0) {
+            printf("mtproto self-test: no text for sent code type 0x%08lx\n",
+                   known[i]);
+            return 2;
+        }
+    }
+    /* The email-required answer must not promise a code. */
+    if (strstr(tg_mtproto_sent_code_text(0xa5491deaUL, 0),
+               "No code is coming") == 0) {
+        puts("mtproto self-test: setUpEmailRequired still promises a code");
+        return 2;
+    }
+    /* An unknown type admits it, and leaves the console line to the caller. */
+    if (tg_mtproto_sent_code_text(0x12345678UL, 0) != 0 ||
+        strstr(tg_mtproto_sent_code_text(0x12345678UL, 1), "did not say") == 0) {
+        puts("mtproto self-test: unknown sent code type pretends to know");
+        return 2;
+    }
+    return 0;
+}
+
 static int tg_mtproto_photo_gate_self_test(void)
 {
     static const unsigned char jpeg_ok[] = {
@@ -19815,6 +19877,15 @@ int tg_gui_session_login_send_code(const char *phone, FILE *stream)
         }
     }
     tg_gui_log("login: send_code done");
+    {
+        /* The one line that answers "where did the code go" from a log the
+           user can send us, instead of from a screenshot of the window. */
+        char route[80];
+
+        sprintf(route, "login: sent code type 0x%08lx, %lu digits",
+                tg_mtproto_sent_code_type, tg_mtproto_sent_code_length());
+        tg_gui_log(route);
+    }
     if (rc != 0) {
         tg_mtproto_capture_quiet_error(
             quiet, stream, tg_gui_session_state.login.last_error,
