@@ -3,74 +3,57 @@
 #
 # AROS aarch64 (ARM64) build file.
 #
-# For native AROS aarch64 builds (e.g. Raspberry Pi 400 running AROS
-# One).  Cross-build users can set AROS_TOOLCHAIN and AROS_SDK_ROOT
-# when a matching SDK/toolchain is available on the host.
+# Targets the modern aarch64-aros cross-toolchain (GCC 6.5.0, crosstools)
+# used for AROS on the Raspberry Pi. The compiler's default spec links the
+# posixc libc, startup.o and libautoinit automatically; no -nostdlib and no
+# manual SDK paths are needed. Native aarch64 AROS builds can set CC=gcc.
 #
-# No external SSL/TLS libraries required: Telegram Amiga handles all
-# MTProto encryption internally.
+# No external SSL/TLS libraries required: Telegram Amiga handles all MTProto
+# encryption internally.
 
-ifdef AROS_TOOLCHAIN
-CC = $(AROS_TOOLCHAIN)/aarch64-aros-gcc
-OBJCOPY ?= $(AROS_TOOLCHAIN)/aarch64-aros-objcopy
-else
-CC ?= gcc
-OBJCOPY ?= objcopy
-endif
-CFLAGS ?= -Wall -Wextra -O2 -Iinclude
+AROS_TOOLCHAIN ?= $(HOME)/aros-toolchains/aros-toolchain-aarch64
+CC = $(AROS_TOOLCHAIN)/bin/aarch64-aros-gcc
+SYSROOT ?= $(AROS_TOOLCHAIN)/sysroot
 TARGET ?= build/aros-aarch64/TelegramAmiga
-SRC := src/main.c core/tg_app.c core/tg_bot.c core/tg_config.c core/tg_console.c core/tg_console_ui.c core/tg_console_tui.c core/tg_gui.c core/tg_gui_window.c core/tg_chat_engine.c core/tg_gui_driver.c core/tg_client_state.c core/tg_offset_state.c core/tg_text_client.c core/tg_file.c core/tg_http.c core/tg_https.c core/tg_json.c core/tg_telegram.c core/tg_log.c core/tg_mtproto.c core/tg_mtproto_auth.c core/tg_mtproto_bigint.c core/tg_mtproto_dc.c core/tg_mtproto_envelope.c core/tg_mtproto_encrypted.c core/tg_mtproto_login.c core/tg_mtproto_message_id.c core/tg_mtproto_probe.c core/tg_mtproto_rsa.c core/tg_mtproto_crypto.c core/tg_mtproto_session.c core/tg_mtproto_srp.c core/tg_mtproto_tl.c core/tg_mtproto_transport.c core/tg_net.c core/tg_tls.c platforms/aros/tg_platform_aros.c platforms/aros/tg_aros_autoinit.c
+BUILD_DIR := $(dir $(TARGET))
+
+SRC := src/main.c core/tg_app.c core/tg_bot.c core/tg_config.c core/tg_console.c core/tg_console_ui.c core/tg_console_tui.c core/tg_gui.c core/tg_gui_window.c core/tg_chat_engine.c core/tg_gui_driver.c core/tg_client_state.c core/tg_offset_state.c core/tg_text_client.c core/tg_file.c core/tg_http.c core/tg_https.c core/tg_json.c core/tg_telegram.c core/tg_log.c core/tg_mtproto.c core/tg_mtproto_auth.c core/tg_mtproto_bigint.c core/tg_mtproto_dc.c core/tg_mtproto_envelope.c core/tg_mtproto_encrypted.c core/tg_mtproto_login.c core/tg_mtproto_message_id.c core/tg_mtproto_probe.c core/tg_mtproto_rsa.c core/tg_mtproto_crypto.c core/tg_mtproto_session.c core/tg_mtproto_srp.c core/tg_mtproto_tl.c core/tg_mtproto_transport.c core/tg_net.c core/tg_tls.c platforms/aros/tg_platform_aros.c
+
+CPPFLAGS += -Iinclude --sysroot=$(SYSROOT)
+CFLAGS ?= -Wall -Wextra -O2 -ffixed-x18
 ENABLE_TLS ?= 0
 ENABLE_GZIP ?= 0
 ENABLE_GZIP_PUFF ?= 1
-SDK_GCC_ROOT ?= $(AROS_TOOLCHAIN)/lib/gcc/aarch64-aros/10.5.0
-
-ifneq ($(AROS_SDK_ROOT),)
-CFLAGS += -D__AROS__
-CPPFLAGS += -nostdinc \
-	-isystem "$(SDK_GCC_ROOT)/include" \
-	-isystem "$(SDK_GCC_ROOT)/include-fixed" \
-	-I"$(AROS_SDK_ROOT)/include/aros/posixc" \
-	-I"$(AROS_SDK_ROOT)/include/aros/stdc" \
-	-I"$(AROS_SDK_ROOT)/include"
-LDFLAGS += -nostdlib \
-	-L"$(AROS_SDK_ROOT)/lib" \
-	-L"$(SDK_GCC_ROOT)"
-LDSTART := "$(AROS_SDK_ROOT)/lib/startup.o"
-LDLIBS += -lautoinit -lcrtprog -lcrt -lstdlib -lstdc.static \
-	-lamiga -laros -ldos -lexec -lutility -lgcc -lautoinit -lamiga
-MINCRT_LDLIBS := -lautoinit -lamiga -laros -ldos -lexec -lutility -lgcc \
-	-lautoinit -lamiga
-endif
 
 ifeq ($(ENABLE_TLS),1)
-CFLAGS += -DTG_ENABLE_TLS=1
-LDLIBS := -lssl -lcrypto $(LDLIBS)
+CPPFLAGS += -DTG_ENABLE_TLS=1
 endif
 
 ifeq ($(ENABLE_GZIP),1)
-CFLAGS += -DTG_ENABLE_GZIP=1
-LDLIBS := -lz $(LDLIBS)
+CPPFLAGS += -DTG_ENABLE_GZIP=1
 endif
 
 ifeq ($(ENABLE_GZIP_PUFF),1)
-CFLAGS += -DTG_ENABLE_GZIP_PUFF=1 -Ithird_party/puff
+CPPFLAGS += -DTG_ENABLE_GZIP_PUFF=1 -Ithird_party/puff
 
+# Release lanes ship without the offline self-tests (decision 2026-08-07):
+# CI runs the full suite on the host binary, so on device they are only dead
+# weight. NO_SELFTEST=0 compiles them back in for a debugging build.
 NO_SELFTEST ?= 1
 ifeq ($(NO_SELFTEST),1)
-CFLAGS += -DTG_NO_SELFTEST=1
+CPPFLAGS += -DTG_NO_SELFTEST=1
 endif
-SRC += core/tg_avatar.c third_party/tjpgd/tjpgd.c third_party/puff/puff.c
+SRC += core/tg_avatar.c core/tg_emoji_sheet.c third_party/tjpgd/tjpgd.c third_party/puff/puff.c
 endif
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): $(SRC) include/tg_app.h include/tg_bot.h include/tg_config.h include/tg_console.h include/tg_client_state.h include/tg_offset_state.h include/tg_text_client.h include/tg_file.h include/tg_http.h include/tg_https.h include/tg_json.h include/tg_telegram.h include/tg_log.h include/tg_mtproto.h include/tg_mtproto_auth.h include/tg_mtproto_bigint.h include/tg_mtproto_dc.h include/tg_mtproto_envelope.h include/tg_mtproto_encrypted.h include/tg_mtproto_login.h include/tg_mtproto_message_id.h include/tg_mtproto_probe.h include/tg_mtproto_rsa.h include/tg_mtproto_crypto.h include/tg_mtproto_session.h include/tg_mtproto_srp.h include/tg_mtproto_tl.h include/tg_mtproto_transport.h include/tg_net.h include/tg_platform.h include/tg_tls.h third_party/puff/puff.h
-	mkdir -p "$(dir $@)"
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LDSTART) -o "$@" $(SRC) $(LDLIBS)
-	@strings "$@" | grep -F '$$STACK:1048576' >/dev/null || { \
+$(TARGET): $(SRC)
+	mkdir -p "$(BUILD_DIR)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o "$@" $(SRC)
+	@grep -aq '$$STACK:1048576' "$@" || { \
 		echo "ERROR: $@ is missing the 1 MiB AmigaDOS stack cookie" >&2; \
 		rm -f "$@"; exit 1; \
 	}
