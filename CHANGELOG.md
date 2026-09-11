@@ -62,7 +62,8 @@ unless noted.
   build does not recognise says so instead of pretending, with its number in
   the console and in the debug log. The log also records the delivery route
   and the digit count next to "send_code done", so a login that receives
-  nothing can be diagnosed from the log alone.
+  nothing can be diagnosed from the log alone. The delivery line on the
+  code screen no longer cuts "phone" short.
 - Clicking URL text keeps the pointer aligned with literal characters such
   as underscores and tildes, including below a link preview. Wrapped URLs
   keep their complete text and link styling across lines. Clicking the

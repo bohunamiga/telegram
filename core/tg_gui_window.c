@@ -5084,7 +5084,10 @@ static void tg_gui_window_login_code_prompt(tg_gui_state *state)
     /* The status line is short: keep the hint inside it and only add the
        digit count when there is room for it. */
     if (digits > 0UL && digits < 100UL) {
-        sprintf(line, "%.34s (%lu digits)", hint, digits);
+        /* 35, not 34: "Code sent in Telegram on your phone" is 35 characters
+           and the old limit showed it as "...your phon (5 digits)". With two
+           digits at most the line is 47 characters, inside the status. */
+        sprintf(line, "%.35s (%lu digits)", hint, digits);
     } else {
         sprintf(line, "%.46s", hint);
     }
