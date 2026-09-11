@@ -62,8 +62,9 @@ unless noted.
   declares its system language as a full locale, en-US, instead of a bare
   en, the change other third-party clients found to bring the codes back;
   on a number where two requests in half an hour had produced nothing, the
-  first one after it arrived. Logins that were already saved were never
-  affected.
+  first one after it arrived. The same setting had worked since the first
+  release and nobody had reported a problem with it: what changed was how
+  Telegram treats it. Logins that were already saved were never affected.
 - The login screen no longer promises a code Telegram is not sending. One
   delivery answer means "add and verify a login email first", and it used to
   read like any other, so a first user waited for a message that could never
