@@ -16,6 +16,15 @@
 #define TG_CODE_SETTINGS_CONSTRUCTOR 0xad253d78UL
 #define TG_AUTH_SEND_CODE_CONSTRUCTOR 0xa677244fUL
 #define TG_AUTH_SIGN_IN_CONSTRUCTOR 0x8d52a951UL
+#define TG_AUTH_RESEND_CODE_CONSTRUCTOR 0xcae47523UL
+/* initConnection's system_lang_code. Telegram accepted auth.sendCode from a
+   connection that declared a bare "en" here, answered that the code was on
+   its way inside the app, and then never delivered it, on more than one
+   account (2026-09, AROS x86_64 and a forum report). Other third-party
+   clients hit the same silence in 2026 and found that a full locale, en-US,
+   brings the codes back; on a number where two requests in half an hour had
+   produced nothing, the first one with en-US arrived. lang_code stays "en". */
+#define TG_MTPROTO_SYSTEM_LANG_CODE "en-US"
 #define TG_AUTH_SIGN_UP_CONSTRUCTOR 0xaac7b717UL
 #define TG_AUTH_CHECK_PASSWORD_CONSTRUCTOR 0xd18b4d16UL
 #define TG_HELP_GET_CONFIG_CONSTRUCTOR 0xc4f9186bUL
@@ -413,7 +422,7 @@ tg_mtproto_tl_status tg_mtproto_build_init_connection(
         status = tg_write_string(writer, app_version);
     }
     if (status == TG_MTPROTO_TL_OK) {
-        status = tg_write_string(writer, lang_code);
+        status = tg_write_string(writer, TG_MTPROTO_SYSTEM_LANG_CODE);
     }
     if (status == TG_MTPROTO_TL_OK) {
         status = tg_write_string(writer, "");
@@ -454,6 +463,33 @@ tg_mtproto_tl_status tg_mtproto_build_auth_send_code(
     }
     if (status == TG_MTPROTO_TL_OK) {
         status = tg_mtproto_tl_write_u32(writer, 0UL);
+    }
+    return status;
+}
+
+/* auth.resendCode#cae47523 flags:# phone_number:string phone_code_hash:string
+   reason:flags.0?string = auth.SentCode (core.telegram.org, 2026-09-10). The
+   reason is for device-integrity failures on phones; we never set it. */
+tg_mtproto_tl_status tg_mtproto_build_auth_resend_code(
+    tg_mtproto_tl_writer *writer,
+    const char *phone_number,
+    const char *phone_code_hash)
+{
+    tg_mtproto_tl_status status;
+
+    if (writer == 0 || phone_number == 0 || phone_code_hash == 0 ||
+        phone_number[0] == '\0' || phone_code_hash[0] == '\0') {
+        return TG_MTPROTO_TL_INVALID_ARGUMENT;
+    }
+    status = tg_mtproto_tl_write_u32(writer, TG_AUTH_RESEND_CODE_CONSTRUCTOR);
+    if (status == TG_MTPROTO_TL_OK) {
+        status = tg_mtproto_tl_write_u32(writer, 0UL); /* flags: no reason */
+    }
+    if (status == TG_MTPROTO_TL_OK) {
+        status = tg_write_string(writer, phone_number);
+    }
+    if (status == TG_MTPROTO_TL_OK) {
+        status = tg_write_string(writer, phone_code_hash);
     }
     return status;
 }
@@ -2676,7 +2712,6 @@ tg_mtproto_tl_status tg_mtproto_parse_auth_sent_code(
 {
     tg_mtproto_tl_reader reader;
     unsigned long flags;
-    unsigned long unused;
     tg_mtproto_tl_status status;
 
     if (body == 0 || out == 0) {
@@ -2711,8 +2746,14 @@ tg_mtproto_tl_status tg_mtproto_parse_auth_sent_code(
         status = tg_read_string_copy(&reader, out->phone_code_hash,
                                      sizeof(out->phone_code_hash));
     }
+    /* next_type (an auth.CodeType, a bare constructor) is the route
+       auth.resendCode would use, and timeout is how many seconds to wait
+       before asking for it: the two facts behind "send it by SMS
+       instead", which the official apps offer and this client used to
+       throw away. */
     if (status == TG_MTPROTO_TL_OK && (flags & 2UL) != 0UL) {
-        status = tg_mtproto_tl_read_u32(&reader, &unused);
+        status = tg_mtproto_tl_read_u32(&reader, &out->next_type);
+        out->has_next_type = (status == TG_MTPROTO_TL_OK);
     }
     if (status == TG_MTPROTO_TL_OK && (flags & 4UL) != 0UL) {
         status = tg_mtproto_tl_read_u32(&reader, &out->timeout);
@@ -4920,51 +4961,71 @@ static void tg_mtproto_format_document_label(
    webPage e89c45b2, and the three that carry nothing to show, webPageEmpty
    211a1788, webPagePending b0d13e47, webPageNotModified 7311ca11. A pending
    preview is the server still fetching the page; it arrives later through
-   updateWebPage, which this client does not follow yet. */
-static void tg_mtproto_append_web_page(tg_mtproto_tl_reader *reader,
-                                       tg_mtproto_message_text *out)
+   updateWebPage. Keep its id to match that later update. */
+tg_mtproto_tl_status tg_mtproto_read_web_page(tg_mtproto_tl_reader *reader,
+                                             tg_mtproto_web_page *out)
 {
     char site[TG_WEBPAGE_SITE_MAX];
     char title[TG_WEBPAGE_TITLE_MAX];
     char desc[TG_WEBPAGE_DESC_MAX];
     unsigned long ctor;
     unsigned long flags;
-    unsigned long id_hi;
-    unsigned long id_lo;
     unsigned long scratch;
     unsigned long n;
     unsigned long i;
 
+    if (reader == 0 || out == 0) {
+        return TG_MTPROTO_TL_INVALID_ARGUMENT;
+    }
+    memset(out, 0, sizeof(*out));
     site[0] = '\0';
     title[0] = '\0';
     desc[0] = '\0';
-    if (tg_mtproto_tl_read_u32(reader, &ctor) != TG_MTPROTO_TL_OK ||
-        ctor != 0xe89c45b2UL) {
-        return; /* empty, pending or not modified: nothing to draw yet */
+    if (tg_mtproto_tl_read_u32(reader, &ctor) != TG_MTPROTO_TL_OK) {
+        return TG_MTPROTO_TL_INVALID_DATA;
+    }
+    if (ctor == 0x7311ca11UL) { /* webPageNotModified */
+        return TG_MTPROTO_TL_OK;
+    }
+    if (ctor == 0xb0d13e47UL || ctor == 0x211a1788UL) {
+        if (tg_mtproto_tl_read_u32(reader, &flags) != TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_read_u64(reader, &out->id_hi, &out->id_lo) !=
+                TG_MTPROTO_TL_OK ||
+            ((flags & 1UL) != 0UL &&
+             tg_skip_string(reader) != TG_MTPROTO_TL_OK) ||
+            (ctor == 0xb0d13e47UL &&
+             tg_mtproto_tl_read_u32(reader, &scratch) != TG_MTPROTO_TL_OK)) {
+            return TG_MTPROTO_TL_INVALID_DATA;
+        }
+        out->pending = ctor == 0xb0d13e47UL;
+        return TG_MTPROTO_TL_OK;
+    }
+    if (ctor != 0xe89c45b2UL) {
+        return TG_MTPROTO_TL_INVALID_DATA;
     }
     if (tg_mtproto_tl_read_u32(reader, &flags) != TG_MTPROTO_TL_OK ||
-        tg_mtproto_tl_read_u64(reader, &id_hi, &id_lo) != TG_MTPROTO_TL_OK ||
+        tg_mtproto_tl_read_u64(reader, &out->id_hi, &out->id_lo) != TG_MTPROTO_TL_OK ||
         tg_skip_string(reader) != TG_MTPROTO_TL_OK ||  /* url */
         tg_skip_string(reader) != TG_MTPROTO_TL_OK ||  /* display_url */
         tg_mtproto_tl_read_u32(reader, &scratch) != TG_MTPROTO_TL_OK) {
-        return;
+        return TG_MTPROTO_TL_INVALID_DATA;
     }
     if ((flags & 1UL) != 0UL && /* type: "article", "photo", "video", ... */
         tg_skip_string(reader) != TG_MTPROTO_TL_OK) {
-        return;
+        return TG_MTPROTO_TL_INVALID_DATA;
     }
     if ((flags & 2UL) != 0UL &&
         tg_read_string_copy(reader, site, sizeof(site)) != TG_MTPROTO_TL_OK) {
-        return;
+        return TG_MTPROTO_TL_INVALID_DATA;
     }
     if ((flags & 4UL) != 0UL &&
         tg_read_string_copy(reader, title, sizeof(title)) !=
             TG_MTPROTO_TL_OK) {
-        return;
+        return TG_MTPROTO_TL_INVALID_DATA;
     }
     if ((flags & 8UL) != 0UL &&
         tg_read_string_copy(reader, desc, sizeof(desc)) != TG_MTPROTO_TL_OK) {
-        return;
+        return TG_MTPROTO_TL_INVALID_DATA;
     }
     tg_trim_utf8_tail(site);
     tg_trim_utf8_tail(title);
@@ -4980,10 +5041,12 @@ static void tg_mtproto_append_web_page(tg_mtproto_tl_reader *reader,
        inline pipeline as any other and obeys the same Inline photos setting.
        The message keeps its own text, so this is never a photo-only bubble. */
     if ((flags & 16UL) != 0UL) {
-        (void)tg_mtproto_read_photo(reader, &out->photo);
+        if (tg_mtproto_read_photo(reader, &out->photo) != TG_MTPROTO_TL_OK) {
+            return TG_MTPROTO_TL_INVALID_DATA;
+        }
     }
     if (site[0] == '\0' && title[0] == '\0' && desc[0] == '\0') {
-        return; /* a preview with nothing in it is not worth a line */
+        return TG_MTPROTO_TL_OK; /* nothing to label */
     }
     n = (unsigned long)strlen(out->text);
     if (site[0] != '\0' || title[0] != '\0') {
@@ -5007,6 +5070,28 @@ static void tg_mtproto_append_web_page(tg_mtproto_tl_reader *reader,
             out->text[n] = '\0';
         }
         tg_label_append(out->text, sizeof(out->text), &n, desc);
+    }
+    return TG_MTPROTO_TL_OK;
+}
+
+static void tg_mtproto_append_web_page(tg_mtproto_tl_reader *reader,
+                                       tg_mtproto_message_text *out)
+{
+    tg_mtproto_web_page page;
+    unsigned long n;
+
+    if (tg_mtproto_read_web_page(reader, &page) != TG_MTPROTO_TL_OK) {
+        return;
+    }
+    out->pending_webpage_hi = page.pending ? page.id_hi : 0UL;
+    out->pending_webpage_lo = page.pending ? page.id_lo : 0UL;
+    out->photo = page.photo;
+    n = (unsigned long)strlen(out->text);
+    if (page.text[0] != '\0') {
+        if (n != 0UL) {
+            tg_label_append(out->text, sizeof(out->text), &n, "\n");
+        }
+        tg_label_append(out->text, sizeof(out->text), &n, page.text);
     }
     out->has_text = out->text[0] != '\0';
 }
@@ -5770,6 +5855,41 @@ tg_mtproto_tl_status tg_mtproto_parse_updates_summary(
     }
     memset(out, 0, sizeof(*out));
     out->constructor = constructor;
+    if (constructor == 0x74ae4240UL || constructor == 0x725b04c3UL) {
+        unsigned long offset;
+        unsigned long item;
+        unsigned long count;
+        static tg_mtproto_message_text message;
+
+        tg_mtproto_tl_reader_init(&reader, body, body_length);
+        if (tg_mtproto_tl_read_u32(&reader, &item) != TG_MTPROTO_TL_OK ||
+            item != 0x1cb5c415UL ||
+            tg_mtproto_tl_read_u32(&reader, &count) != TG_MTPROTO_TL_OK ||
+            count == 0UL ||
+            tg_mtproto_tl_read_u32(&reader, &item) != TG_MTPROTO_TL_OK ||
+            item != 0x4e90bfd6UL || /* updateMessageID, then id + random_id */
+            tg_mtproto_tl_read_u32(&reader, &out->id) != TG_MTPROTO_TL_OK ||
+            tg_skip_u32s(&reader, 2UL) != TG_MTPROTO_TL_OK) {
+            return TG_MTPROTO_TL_OK;
+        }
+        out->has_sent_message = 1;
+        for (offset = reader.offset; offset + 8UL <= body_length; offset += 4UL) {
+            reader.offset = offset;
+            if (tg_mtproto_tl_read_u32(&reader, &item) != TG_MTPROTO_TL_OK ||
+                (item != 0x1f2b0afdUL && item != 0x62ba04d9UL) ||
+                tg_mtproto_read_update_message_text(&reader, &message, 0) !=
+                    TG_MTPROTO_TL_OK || message.id != out->id) {
+                continue;
+            }
+            out->date = message.date;
+            out->webpage.id_hi = message.pending_webpage_hi;
+            out->webpage.id_lo = message.pending_webpage_lo;
+            out->webpage.pending = message.pending_webpage_hi != 0UL ||
+                                      message.pending_webpage_lo != 0UL;
+            return TG_MTPROTO_TL_OK;
+        }
+        return TG_MTPROTO_TL_OK;
+    }
     if (constructor != TG_UPDATE_SHORT_SENT_MESSAGE_CONSTRUCTOR) {
         return TG_MTPROTO_TL_OK;
     }
@@ -5782,6 +5902,15 @@ tg_mtproto_tl_status tg_mtproto_parse_updates_summary(
         return TG_MTPROTO_TL_INVALID_DATA;
     }
     out->has_sent_message = 1;
+    if ((out->flags & 512UL) != 0UL &&
+        tg_mtproto_tl_read_u32(&reader, &scratch) == TG_MTPROTO_TL_OK &&
+        scratch == 0xddf10c3bUL &&
+        tg_mtproto_tl_read_u32(&reader, &scratch) == TG_MTPROTO_TL_OK) {
+        if (tg_mtproto_read_web_page(&reader, &out->webpage) !=
+                TG_MTPROTO_TL_OK) {
+            memset(&out->webpage, 0, sizeof(out->webpage));
+        }
+    }
     return TG_MTPROTO_TL_OK;
 }
 
@@ -6745,6 +6874,16 @@ int tg_mtproto_login_self_test(void)
         initialized[2] != 0xcdU || initialized[3] != 0xc1U) {
         return 2;
     }
+    /* After flags and api_id come device_model "Amiga" (8 bytes padded),
+       system_version "portable" (12) and app_version "0.1" (4), so offset 36
+       is system_lang_code, then lang_pack and lang_code: pin the full
+       locale that makes Telegram deliver the login code, the empty language
+       pack and the short lang_code. */
+    if (initialized[36] != 5U || memcmp(initialized + 37, "en-US", 5) != 0 ||
+        initialized[44] != 0U ||
+        initialized[48] != 2U || memcmp(initialized + 49, "en", 2) != 0) {
+        return 2;
+    }
 
     tg_mtproto_tl_writer_init(&writer, query, sizeof(query));
     if (tg_mtproto_build_auth_sign_in(&writer, "+1", "hash", "12345") !=
@@ -6816,6 +6955,42 @@ int tg_mtproto_login_self_test(void)
         !sent_code.has_type_length ||
         strcmp(sent_code.phone_code_hash, "hash") != 0) {
         return 2;
+    }
+    /* auth.resendCode, and the two sentCode fields behind it: the route it
+       would take (flags.1 next_type) and the wait before asking (flags.2). */
+    {
+        static const unsigned char expected_resend[] = {
+            0x23U, 0x75U, 0xe4U, 0xcaU,
+            0x00U, 0x00U, 0x00U, 0x00U,
+            0x02U, '+', '1', 0x00U,
+            0x04U, 'h', 'a', 's', 'h', 0x00U, 0x00U, 0x00U
+        };
+
+        tg_mtproto_tl_writer_init(&writer, query, sizeof(query));
+        if (tg_mtproto_build_auth_resend_code(&writer, "+1", "hash") !=
+                TG_MTPROTO_TL_OK ||
+            writer.length != sizeof(expected_resend) ||
+            memcmp(query, expected_resend, sizeof(expected_resend)) != 0) {
+            return 2;
+        }
+        tg_mtproto_tl_writer_init(&writer, rpc, sizeof(rpc));
+        if (tg_mtproto_tl_write_u32(&writer, 6UL) != TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 0x3dbb5986UL) !=
+                TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 5UL) != TG_MTPROTO_TL_OK ||
+            tg_write_string(&writer, "hash") != TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 0x72a3158cUL) !=
+                TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 60UL) != TG_MTPROTO_TL_OK ||
+            tg_mtproto_parse_auth_sent_code(TG_AUTH_SENT_CODE_CONSTRUCTOR, rpc,
+                                            writer.length, &sent_code) !=
+                TG_MTPROTO_TL_OK ||
+            !sent_code.has_next_type ||
+            sent_code.next_type != 0x72a3158cUL ||
+            !sent_code.has_timeout || sent_code.timeout != 60UL ||
+            strcmp(sent_code.phone_code_hash, "hash") != 0) {
+            return 2;
+        }
     }
 
     tg_mtproto_tl_writer_init(&writer, query, sizeof(query));

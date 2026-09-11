@@ -10,6 +10,11 @@
  */
 
 #include "tg_gui.h"
+#include "tg_emoji_sheet.h"
+
+#define TG_GUI_EMOJI_BUTTON_W 22 /* smiley button in the composer row */
+#define TG_GUI_ATTACH_BUTTON_W 22 /* paperclip at the left of the input */
+#define TG_GUI_INPUT_TEXT_PAD 6 /* equal air above and below the glyph block */
 #include "tg_gui_session.h" /* tg_gui_log: crash-safe first-paint trail */
 
 #include <stdio.h>
@@ -240,17 +245,131 @@ int tg_gui_inline_photos_save(const char *path, int enabled)
                                          cache_limit);
 }
 
-int tg_gui_inline_photos_resolve(int explicit_choice, int explicit_value,
-                                 int classic_os3, int cpu_at_least_040,
-                                 int has_rtg)
+int tg_gui_graphics_resolve(int explicit_choice, int explicit_value,
+                            int classic_amiga, int cpu_at_least_040, int has_rtg)
 {
     if (explicit_choice) {
         return explicit_value ? 1 : 0;
     }
-    if (classic_os3 && (!cpu_at_least_040 || !has_rtg)) {
+    if (classic_amiga && (!cpu_at_least_040 || !has_rtg)) {
         return 0;
     }
     return 1;
+}
+
+void tg_gui_graphics_preferences_resolve(tg_gui_state *state, int classic_amiga,
+                                        int cpu_at_least_040, int has_rtg)
+{
+    if (state == 0) {
+        return;
+    }
+    if (!state->inline_photos_default_resolved) {
+        state->inline_photos = tg_gui_graphics_resolve(
+            state->inline_photos_explicit, state->inline_photos,
+            classic_amiga, cpu_at_least_040, has_rtg);
+        state->inline_photos_default_resolved = 1;
+    }
+    if (!state->emoji_default_resolved) {
+        state->emoji_enabled = tg_gui_graphics_resolve(
+            state->emoji_explicit, state->emoji_enabled,
+            classic_amiga, cpu_at_least_040, has_rtg);
+        state->emoji_default_resolved = 1;
+    }
+    if (!state->emoji_enabled) {
+        tg_gui_emoji_close(state);
+    }
+}
+
+void tg_gui_emoji_preferences_load(const char *path, int *enabled,
+                                   int *explicit_choice)
+{
+    /* The same on/off/auto first line, in a separate preference file. */
+    tg_gui_photo_preferences_load(path, enabled, explicit_choice, 0, 0);
+}
+
+int tg_gui_emoji_preferences_save(const char *path, int enabled)
+{
+    FILE *file;
+    char tmp[288];
+    unsigned long length;
+    int failed;
+
+    if (path == 0 || path[0] == '\0') {
+        return 1;
+    }
+    length = (unsigned long)strlen(path);
+    if (length + 5UL >= sizeof(tmp)) {
+        return 1;
+    }
+    memcpy(tmp, path, length);
+    memcpy(tmp + length, ".tmp", 5UL);
+    file = fopen(tmp, "wb");
+    if (file == 0) {
+        return 1;
+    }
+    failed = fputs(enabled ? "on\n" : "off\n", file) == EOF;
+    if (fclose(file) != 0) {
+        failed = 1;
+    }
+    if (failed) {
+        (void)remove(tmp);
+        return 1;
+    }
+    (void)remove(path);
+    if (rename(tmp, path) != 0) {
+        (void)remove(tmp);
+        return 1;
+    }
+    return 0;
+}
+
+void tg_gui_set_emoji_enabled(tg_gui_state *state, int enabled)
+{
+    if (state == 0) {
+        return;
+    }
+    state->emoji_enabled = enabled ? 1 : 0;
+    state->emoji_explicit = 1;
+    state->emoji_default_resolved = 1;
+    if (!state->emoji_enabled) {
+        tg_gui_emoji_close(state);
+    }
+}
+
+int tg_gui_emoji_inline_size(const tg_gui_state *state, int font_height)
+{
+    /* Keep the sheet readable even with Topaz 8. The shared line metrics
+       reserve room for this cell instead of falling back to text. */
+    if (state == 0 || !state->emoji_enabled) {
+        return 0;
+    }
+    return font_height < TG_EMOJI_GLYPH_SIZE ? TG_EMOJI_GLYPH_SIZE : font_height;
+}
+
+int tg_gui_font_line_height(const tg_gui_state *state, int font_height)
+{
+    int cell;
+
+    if (font_height <= 0) {
+        font_height = 8;
+    }
+    cell = tg_gui_emoji_inline_size(state, font_height);
+    return (cell > font_height ? cell : font_height) + 2;
+}
+
+int tg_gui_font_cell_ascent(const tg_gui_state *state, int font_height,
+                            int font_baseline)
+{
+    int cell;
+
+    if (font_height <= 0) {
+        font_height = 8;
+    }
+    if (font_baseline <= 0 || font_baseline > font_height) {
+        font_baseline = font_height;
+    }
+    cell = tg_gui_font_line_height(state, font_height) - 2;
+    return font_baseline + (cell - font_height) / 2;
 }
 
 static int tg_gui_photo_cache_older(const tg_gui_photo_cache_item *a,
@@ -581,6 +700,7 @@ void tg_gui_demo_state(tg_gui_state *state)
     memset(state, 0, sizeof(*state));
     state->theme = TG_GUI_THEME_DARK;
     state->inline_photos = 1;
+    state->emoji_enabled = 1;
     state->photo_dither = TG_GUI_PHOTO_DITHER_FULL;
     state->photo_cache_limit_mb = TG_GUI_PHOTO_CACHE_DEFAULT_MB;
 
@@ -697,6 +817,14 @@ static int tg_gui_wrap(tg_gui_backend *backend, const char *text, int max_width,
             lengths[line] = last_space - line_start;
             i = last_space + 1UL;
         } else {
+            /* A forced break inside a word: never between the two bytes of an
+               emoji pair, which would draw as two garbage glyphs and send as
+               two stray bytes. Step back to keep the pair whole on the next
+               line (a line holding just one pair still advances). */
+            if (j > line_start + 1UL &&
+                tg_gui_emoji_pair_at(text, total, j - 1UL, 0)) {
+                --j;
+            }
             starts[line] = line_start;
             lengths[line] = j - line_start;
             i = j;
@@ -704,6 +832,94 @@ static int tg_gui_wrap(tg_gui_backend *backend, const char *text, int max_width,
         ++line;
     }
     return line;
+}
+
+int tg_gui_emoji_pair_at(const char *text, unsigned long len, unsigned long i,
+                         unsigned long *index)
+{
+    unsigned char p;
+    unsigned char b;
+
+    if (text == 0 || i + 1UL >= len) {
+        return 0;
+    }
+    p = (unsigned char)text[i];
+    b = (unsigned char)text[i + 1UL];
+    if ((p != TG_GUI_EMOJI_PREFIX0 && p != TG_GUI_EMOJI_PREFIX1) ||
+        b < TG_GUI_EMOJI_INDEX_MIN || b > TG_GUI_EMOJI_INDEX_MAX || b == '@') {
+        return 0;
+    }
+    if (index != 0) {
+        unsigned long k = (unsigned long)(b - TG_GUI_EMOJI_INDEX_MIN);
+
+        if (b > '@') {
+            --k; /* the slot '@' would have taken */
+        }
+        *index = (p == TG_GUI_EMOJI_PREFIX1 ? TG_GUI_EMOJI_PER_PREFIX : 0UL) + k;
+    }
+    return 1;
+}
+
+int tg_gui_emoji_encode(unsigned long index, char *out)
+{
+    unsigned long k;
+    unsigned char b;
+
+    if (out == 0 || index >= TG_GUI_EMOJI_MAX) {
+        return 0;
+    }
+    k = index % TG_GUI_EMOJI_PER_PREFIX;
+    b = (unsigned char)(TG_GUI_EMOJI_INDEX_MIN + k);
+    if (b >= '@') {
+        ++b; /* skip '@' */
+    }
+    out[0] = (char)(index < TG_GUI_EMOJI_PER_PREFIX ? TG_GUI_EMOJI_PREFIX0
+                                                    : TG_GUI_EMOJI_PREFIX1);
+    out[1] = (char)b;
+    return 1;
+}
+
+int tg_gui_emoji_index_of(unsigned long codepoint)
+{
+    unsigned long i;
+
+    for (i = 0UL; i < tg_emoji_sheet_count; ++i) {
+        if (tg_emoji_sheet_codepoints[i] == codepoint) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+unsigned long tg_gui_text_unit_len(const char *text, unsigned long len,
+                                   unsigned long i)
+{
+    return tg_gui_emoji_pair_at(text, len, i, 0) ? 2UL : 1UL;
+}
+
+int tg_gui_composer_insert_emoji(tg_gui_state *state, unsigned long index)
+{
+    char pair[2];
+    unsigned long n;
+    unsigned long c;
+
+    if (state == 0 || !state->emoji_enabled ||
+        !tg_gui_emoji_encode(index, pair)) {
+        return 0;
+    }
+    n = (unsigned long)strlen(state->input);
+    if (n + 2UL >= sizeof(state->input)) {
+        return 0;
+    }
+    c = (unsigned long)state->input_caret;
+    if (c > n) {
+        c = n;
+    }
+    memmove(&state->input[c + 2UL], &state->input[c], n - c + 1UL);
+    state->input[c] = pair[0];
+    state->input[c + 1UL] = pair[1];
+    state->input_caret = (int)(c + 2UL);
+    return 1;
 }
 
 static tg_gui_rect tg_gui_make_rect(int x, int y, int w, int h)
@@ -746,6 +962,51 @@ static int tg_gui_centred_baseline(tg_gui_backend *backend, int box_y,
         ascent = glyph_h;
     }
     return box_y + ((box_h - glyph_h) / 2) + ascent;
+}
+
+/* Navigation uses native font metrics, independent of the larger emoji cell
+   reserved for messages and the composer. */
+static int tg_gui_native_line_height(tg_gui_backend *backend)
+{
+    int h = backend->font_height != 0 ? backend->font_height(backend)
+                                        : backend->line_height(backend) - 2;
+
+    if (h <= 0) {
+        h = 8;
+    }
+    return h + 2;
+}
+
+int tg_gui_navigation_line_height(const tg_gui_state *state, int fallback)
+{
+    return state != 0 && state->nav_lh > 0 ? state->nav_lh : fallback;
+}
+
+static int tg_gui_navigation_baseline(tg_gui_backend *backend, int box_y,
+                                       int box_h)
+{
+    int native_h = tg_gui_native_line_height(backend) - 2;
+    int cell_h = backend->line_height(backend) - 2;
+    int ascent = native_h;
+
+    if (backend->font_ascent != 0) {
+        ascent = backend->font_ascent(backend);
+        if (cell_h > native_h) {
+            ascent -= (cell_h - native_h) / 2;
+        }
+        if (ascent <= 0 || ascent > native_h) {
+            ascent = native_h;
+        }
+    }
+    /* Centre the native letters first. Cancelling the virtual cell's padding
+       before dividing also avoids a one-pixel toggle jump with odd fonts. */
+    return box_y + (box_h - native_h) / 2 + ascent;
+}
+
+/* Preserve the pre-emoji avatar dimensions on each platform. */
+static int tg_gui_avatar_size(tg_gui_backend *backend, int header)
+{
+    return 2 * tg_gui_native_line_height(backend) - (header ? 2 : 0);
 }
 
 /* Left inset of a disc of diameter h at pixel row y. Doubled coordinates
@@ -926,7 +1187,7 @@ static void tg_gui_paint_scrollbar(tg_gui_backend *backend, int x, int track_y,
 /* The sidebar search box (top strip): its own background + the query/placeholder
    + a caret that blinks when focused. Standalone so the caret blink can repaint
    just this strip (via tg_gui_paint_caret) instead of the whole window. */
-static int tg_gui_input_text_w(int width, int sidebar_w);
+static int tg_gui_input_text_w(const tg_gui_state *state, int width, int sidebar_w);
 static int tg_gui_input_rows(const tg_gui_state *state, tg_gui_backend *backend,
                              int width, int sidebar_w);
 
@@ -1036,7 +1297,7 @@ int tg_gui_search_click_caret(const tg_gui_state *state,
         return -1;
     }
     width = backend->width(backend);
-    lh = backend->line_height(backend);
+    lh = tg_gui_native_line_height(backend);
     if (width <= 0 || lh <= 0) {
         return -1;
     }
@@ -1079,7 +1340,7 @@ int tg_gui_input_click_caret(const tg_gui_state *state,
         return -1;
     }
     sidebar_w = tg_gui_sidebar_w(width);
-    area_x = sidebar_w + 12;
+    area_x = sidebar_w + 12 + TG_GUI_ATTACH_BUTTON_W;
     rows = tg_gui_input_rows(state, backend, width, sidebar_w);
     input_h = (rows * lh) + 14;
     box_top = (height - (lh + 6)) - input_h;
@@ -1087,13 +1348,13 @@ int tg_gui_input_click_caret(const tg_gui_state *state,
         return 0; /* empty input: anywhere in the box is offset 0 */
     }
     n = tg_gui_wrap(backend, state->input,
-                    tg_gui_input_text_w(width, sidebar_w), starts, lengths,
+                    tg_gui_input_text_w(state, width, sidebar_w), starts, lengths,
                     TG_GUI_WRAP_MAX_LINES);
     if (n < 1) {
         n = 1;
     }
     first = (n > rows) ? (n - rows) : 0;
-    line = first + ((y - (box_top + 2)) / lh);
+    line = first + ((y - (box_top + TG_GUI_INPUT_TEXT_PAD)) / lh);
     if (line < first) {
         line = first;
     }
@@ -1115,13 +1376,13 @@ static void tg_gui_paint_search_box(const tg_gui_state *state,
     int sbase;
 
     width = backend->width(backend);
-    lh = backend->line_height(backend);
+    lh = tg_gui_native_line_height(backend);
     if (width <= 0 || lh <= 0) {
         return;
     }
     sidebar_w = tg_gui_sidebar_w(width);
     search_h = lh + 10;
-    sbase = (search_h / 2) + 4;
+    sbase = tg_gui_navigation_baseline(backend, 0, search_h);
     backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
                        tg_gui_make_rect(0, 0, sidebar_w, search_h));
     if (state->search_query[0] != '\0') {
@@ -1220,6 +1481,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
          i < state->chat_count && y + row_h <= content_h; ++i) {
         const tg_gui_chat *chat;
         int avatar;
+        int avatar_y;
         int text_x;
         int name_pen;
         int preview_pen;
@@ -1246,7 +1508,8 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                                tg_gui_make_rect(0, y, sidebar_w, row_h));
         }
 
-        avatar = (2 * lh);
+        avatar = tg_gui_avatar_size(backend, 0);
+        avatar_y = y + (row_h - avatar) / 2;
         /* The background this row painted under its round chrome: the edge
            smoothing must blend toward it, or the ring reads as a halo. */
         backend->round_bg =
@@ -1260,10 +1523,10 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
         if (backend->avatar_image == 0 ||
             !backend->avatar_image(backend, chat->peer_id_hi,
                                    chat->peer_id_lo,
-                                   tg_gui_make_rect(8, y + 6, avatar,
+                                   tg_gui_make_rect(8, avatar_y, avatar,
                                                     avatar))) {
             backend->avatar_fill(backend, chat->avatar_color,
-                                 tg_gui_make_rect(8, y + 6, avatar, avatar));
+                                 tg_gui_make_rect(8, avatar_y, avatar, avatar));
             /* Centre the initials in the circle: measured width across, and
                the shared centred baseline down. The old hand-tuned formula
                (half a cell below the middle, minus a guessed descent) was
@@ -1273,7 +1536,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 unsigned long ilen = (unsigned long)strlen(chat->initials);
                 int iw = backend->text_width(backend, chat->initials, ilen);
                 int ix = 8 + ((avatar - iw) / 2);
-                int iy = tg_gui_centred_baseline(backend, y + 6, avatar);
+                int iy = tg_gui_navigation_baseline(backend, avatar_y, avatar);
 
                 if (ix < 8) {
                     ix = 8;
@@ -1289,7 +1552,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
             int badge_w;
             int badge_x;
             int has_preview;
-            int row_mid;
+            int slot_h;
             int name_baseline;
             int name_limit;
 
@@ -1300,12 +1563,12 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                per-chat fill) the row keeps the two-line name-over-preview
                layout with the time top-right. */
             has_preview = chat->preview[0] != '\0';
-            row_mid = y + 6 + lh; /* avatar centre == initials baseline */
-            /* Single line: drop the name a couple of pixels below the initials
-               baseline so it sits at the optical centre between the avatar and
-               badge bubbles (the bitmap-font descent makes a baseline-aligned
-               name read high). */
-            name_baseline = has_preview ? (y + 4 + lh) : (row_mid + 2);
+            /* Two equal slots fit 16px emoji even with topaz 8, without growing
+               the row. Single-line names share the avatar's centre. */
+            slot_h = row_h / 2;
+            name_baseline = has_preview
+                ? tg_gui_navigation_baseline(backend, y, slot_h)
+                : tg_gui_navigation_baseline(backend, y, row_h);
 
             badge[0] = '\0';
             badge_w = 0;
@@ -1336,12 +1599,14 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 int preview_limit;
 
                 backend->draw_text(backend, TG_GUI_PEN_TEXT_DIM, sidebar_w - 34,
-                                   y + 4 + lh, chat->time,
+                                   name_baseline, chat->time,
                                    (unsigned long)strlen(chat->time));
                 preview_limit = (chat->unread > 0) ? (badge_x - 4)
                                                    : (sidebar_w - 10);
                 tg_gui_draw_clipped(backend, preview_pen, text_x,
-                                    y + 8 + (2 * lh), chat->preview,
+                                    tg_gui_navigation_baseline(backend, y + slot_h,
+                                                               slot_h),
+                                    chat->preview,
                                     preview_limit - text_x);
             }
             if (chat->unread > 0) {
@@ -1353,8 +1618,8 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 /* Two-line: pill on the preview line. Single-line: pill centred
                    on the row middle, level with the name and avatar. The count
                    stays inside the fill either way. */
-                badge_top = has_preview ? ((y + 8 + (2 * lh)) - lh)
-                                        : (row_mid - (badge_h / 2));
+                badge_top = has_preview ? y + slot_h + (slot_h - badge_h) / 2
+                                        : y + (row_h - badge_h) / 2;
                 /* A chat that just got a notification draws its badge in the
                    accent pen to stand out; the live event loop toggles
                    chat->flash for a true blink. */
@@ -1371,7 +1636,7 @@ static void tg_gui_paint_sidebar(const tg_gui_state *state,
                 /* Centred in the pill both ways: horizontally above, and
                    vertically from the font's own ascent. */
                 backend->draw_text(backend, TG_GUI_PEN_BADGE_TEXT, num_x,
-                                   tg_gui_centred_baseline(backend, badge_top,
+                                   tg_gui_navigation_baseline(backend, badge_top,
                                                            badge_h),
                                    badge, (unsigned long)strlen(badge));
             }
@@ -1434,7 +1699,8 @@ static unsigned long tg_gui_link_span(const char *text, unsigned long i,
         (n > 8UL && strncmp(text + i, "https://", 8) == 0) ||
         (n > 4UL && strncmp(text + i, "www.", 4) == 0)) {
         end = i;
-        while (end < length && text[end] != ' ' && text[end] != '\t') {
+        while (end < length && text[end] != ' ' && text[end] != '\t' &&
+               text[end] != '\n') {
             ++end;
         }
         while (end > i && (text[end - 1UL] == '.' || text[end - 1UL] == ',' ||
@@ -1449,6 +1715,22 @@ static unsigned long tg_gui_link_span(const char *text, unsigned long i,
     return 0UL;
 }
 
+/* A wrapped line or selection can start inside a URL. Keep the complete
+   word's context, so its literal markup characters still occupy pixels. */
+static unsigned long tg_gui_link_remaining(const char *text, unsigned long at,
+                                            unsigned long length)
+{
+    unsigned long start = at;
+    unsigned long end;
+
+    while (start > 0UL && text[start - 1UL] != ' ' &&
+           text[start - 1UL] != '\t' && text[start - 1UL] != '\n') {
+        --start;
+    }
+    end = start + tg_gui_link_span(text, start, length);
+    return end > at ? end - at : 0UL;
+}
+
 /* Draws one wrapped line of message text, interpreting the inline markup
    markers (* _ ` ~) as styling: each marker toggles a TG_GUI_STYLE_* bit, is
    not drawn itself, and the run between markers is drawn in the current style
@@ -1459,17 +1741,20 @@ static unsigned long tg_gui_link_span(const char *text, unsigned long i,
    unstyled. */
 static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                                int x, int baseline, const char *text,
-                               unsigned long length, int *style)
+                               unsigned long from, unsigned long length,
+                               int *style)
 {
-    unsigned long run_start = 0UL;
-    unsigned long link_left = 0UL; /* chars of the current link still to draw */
+    unsigned long run_start = from;
+    unsigned long text_length = (unsigned long)strlen(text);
+    unsigned long link_left = tg_gui_link_remaining(text, from, text_length);
+    unsigned long to = from + length;
     unsigned long i;
 
-    for (i = 0UL; i <= length; ++i) {
+    for (i = from; i <= to; ++i) {
         int toggle = 0;
         int boundary = 0;
 
-        if (i < length) {
+        if (i < to) {
             /* Markup markers are text INSIDE a link: an underscore in
                en.wikipedia.org/wiki/Amiga_500 is part of the address, not an
                italic switch. Reading it as markup dropped the byte from the
@@ -1491,8 +1776,9 @@ static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                 break;
             }
             if (link_left == 0UL &&
-                (i == 0UL || text[i - 1UL] == ' ' || text[i - 1UL] == '\t')) {
-                unsigned long span = tg_gui_link_span(text, i, length);
+                (i == 0UL || text[i - 1UL] == ' ' || text[i - 1UL] == '\t' ||
+                 text[i - 1UL] == '\n')) {
+                unsigned long span = tg_gui_link_span(text, i, text_length);
 
                 if (span > 0UL) {
                     link_left = span;
@@ -1500,7 +1786,7 @@ static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                 }
             }
         }
-        if (toggle != 0 || boundary || i == length) {
+        if (toggle != 0 || boundary || i == to) {
             if (i > run_start) {
                 if (backend->set_style != 0) {
                     backend->set_style(backend, link_left > 0UL && !boundary
@@ -1523,7 +1809,7 @@ static void tg_gui_draw_markup(tg_gui_backend *backend, int pen, int link_pen,
                 run_start = i; /* link boundary: the run resumes here */
             }
         }
-        if (link_left > 0UL && i < length) {
+        if (link_left > 0UL && i < to) {
             --link_left;
             if (link_left == 0UL) {
                 /* Link ends AFTER this char: flush it in link style now. */
@@ -1710,16 +1996,17 @@ static void tg_gui_photo_geometry(const tg_gui_message *message,
     *out_h = h;
 }
 
-/* Width of text[0..len) AS RENDERED by tg_gui_draw_markup: the style marker
-   chars (* _ ` ~) are elided there and never advance x, so they must not be
-   measured either -- or the selection tint and the char-under-pointer mapping
-   drift right of the glyphs by one marker width each. Amiga font widths are
-   additive (no kerning), so summing the runs equals the drawn advance. */
+/* Width of text[from..to) as rendered: style markers occupy no pixels,
+   except inside URLs where they are literal text. The painter and pointer
+   mapping both retain URL context across wrapping and selection boundaries.
+   Amiga font widths are additive (no kerning), so runs sum to the advance. */
 static int tg_gui_marked_width(tg_gui_backend *backend, const char *text,
                                unsigned long from, unsigned long to)
 {
     unsigned long i;
     unsigned long run;
+    unsigned long length = (unsigned long)strlen(text);
+    unsigned long link_end = from + tg_gui_link_remaining(text, from, length);
     int w = 0;
 
     run = from;
@@ -1727,7 +2014,12 @@ static int tg_gui_marked_width(tg_gui_backend *backend, const char *text,
         int marker = 0;
 
         if (i < to) {
-            marker = (text[i] == '*' || text[i] == '_' || text[i] == '`' ||
+            if (i >= link_end && (i == 0UL || text[i - 1UL] == ' ' ||
+                                 text[i - 1UL] == '\t' || text[i - 1UL] == '\n')) {
+                link_end = i + tg_gui_link_span(text, i, length);
+            }
+            marker = i >= link_end &&
+                     (text[i] == '*' || text[i] == '_' || text[i] == '`' ||
                       text[i] == '~');
         }
         if (marker || i == to) {
@@ -1994,7 +2286,9 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
             }
             if (!grouped && (y + lh) <= bottom && y >= top) {
                 backend->draw_text(backend, sender_pen + TG_GUI_PEN_COUNT,
-                                   bubble_x + 2, y + lh, message->sender,
+                                   bubble_x + 2,
+                                   tg_gui_centred_baseline(backend, y, lh),
+                                   message->sender,
                                    (unsigned long)strlen(message->sender));
             }
         }
@@ -2024,8 +2318,8 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
     if (has_reply) {
         int reply_baseline;
 
-        reply_baseline = y + header_h + lh;
-        if (reply_baseline <= bottom && reply_baseline - lh >= top) {
+        reply_baseline = tg_gui_centred_baseline(backend, y + header_h, lh);
+        if (y + header_h >= top && y + header_h + lh <= bottom) {
             char line[TG_GUI_REPLY_MAX + 4];
 
             line[0] = '>';
@@ -2073,10 +2367,11 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
     style = 0;
     for (k = 0; k < line_count; ++k) {
         int baseline;
+        int line_top;
 
-        baseline = y + header_h + reply_h + photo_h + photo_gap +
-                   (k * lh) + lh;
-        if (baseline <= bottom && baseline - lh >= top) {
+        line_top = y + header_h + reply_h + photo_h + photo_gap + (k * lh);
+        baseline = tg_gui_centred_baseline(backend, line_top, lh);
+        if (line_top >= top && line_top + lh <= bottom) {
             /* Mouse selection: tint the selected char range of THIS visual
                line before the glyphs go down, so the text stays crisp on the
                SELECT band (same language as the selected sidebar row). */
@@ -2094,8 +2389,8 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
                     int sw = tg_gui_marked_width(backend, message->text,
                                                  (unsigned long)lo,
                                                  (unsigned long)hi);
-                    int sy = baseline - lh + 3;
-                    int sh = lh;
+                    int sy = line_top + 1;
+                    int sh = lh - 2;
 
                     if (sy < top) { /* clip to the transcript viewport */
                         sh -= top - sy;
@@ -2117,7 +2412,7 @@ static int tg_gui_paint_bubble(tg_gui_backend *backend,
                                message->is_own ? TG_GUI_PEN_READ
                                                : TG_GUI_PEN_LINK,
                                bubble_x + pad, baseline,
-                               message->text + starts[k], lengths[k], &style);
+                               message->text, starts[k], lengths[k], &style);
         }
     }
     if (backend->set_style != 0) {
@@ -2192,11 +2487,12 @@ static int tg_gui_message_height(tg_gui_backend *backend,
 
 /* Width available for the typed text: from the text origin to just before the
    Send button at width-64. */
-static int tg_gui_input_text_w(int width, int sidebar_w)
+static int tg_gui_input_text_w(const tg_gui_state *state, int width, int sidebar_w)
 {
     int w;
 
-    w = (width - 64) - (sidebar_w + 12) - 8;
+    w = (width - 64 - (state->emoji_enabled ? TG_GUI_EMOJI_BUTTON_W : 0)) -
+        (sidebar_w + 12 + TG_GUI_ATTACH_BUTTON_W) - 8;
     if (w < 20) {
         w = 20;
     }
@@ -2215,7 +2511,7 @@ static int tg_gui_input_rows(const tg_gui_state *state, tg_gui_backend *backend,
         return 1;
     }
     n = tg_gui_wrap(backend, state->input,
-                    tg_gui_input_text_w(width, sidebar_w), starts, lengths,
+                    tg_gui_input_text_w(state, width, sidebar_w), starts, lengths,
                     TG_GUI_WRAP_MAX_LINES);
     if (n < 1) {
         n = 1;
@@ -2258,6 +2554,507 @@ int tg_gui_input_layout_height(const tg_gui_state *state,
     return tg_gui_input_h(state, backend, width, sidebar_w, lh);
 }
 
+/* --- Emoji picker --------------------------------------------------------- */
+
+/* A small monochrome paperclip, drawn with the current theme's pens. This
+   independent 16px outline needs no image datatype, file or palette. */
+static void tg_gui_paint_attach_button(tg_gui_backend *backend, int sidebar_w,
+                                       int box_top, int input_h)
+{
+    static const unsigned short rows[16] = {
+        0x0020U, 0x00f0U, 0x0198U, 0x038cU,
+        0x078cU, 0x0718U, 0x0f18U, 0x1e30U,
+        0x3c6cU, 0x38ccU, 0x3998U, 0x2fb0U,
+        0x3760U, 0x18c0U, 0x0fc0U, 0x0200U
+    };
+    int bx = sidebar_w + 8 + (TG_GUI_ATTACH_BUTTON_W - 16) / 2;
+    int by = box_top + (input_h - 4 - 16) / 2;
+    int y;
+
+    for (y = 0; y < 16; ++y) {
+        int x = 0;
+
+        while (x < 16) {
+            int start;
+
+            if ((rows[y] & (0x8000U >> x)) == 0U) {
+                ++x;
+                continue;
+            }
+            start = x++;
+            while (x < 16 && (rows[y] & (0x8000U >> x)) != 0U) {
+                ++x;
+            }
+            backend->fill_rect(backend, TG_GUI_PEN_TEXT_DIM,
+                               tg_gui_make_rect(bx + start, by + y,
+                                                x - start, 1));
+        }
+    }
+}
+
+/* The smiley button between the input and Send, in the spirit of the desktop
+   client's toggle at the right end of the field: a sheet glyph in a square,
+   the first grinning face if the sheet has it. */
+static void tg_gui_paint_emoji_button(const tg_gui_state *state,
+                                      tg_gui_backend *backend, int width,
+                                      int box_top, int input_h)
+{
+    int side = input_h - 8;
+    int idx;
+    int bx;
+    int by;
+
+    if (side > TG_EMOJI_GLYPH_SIZE) {
+        side = TG_EMOJI_GLYPH_SIZE;
+    }
+    if (side < 8) {
+        side = 8;
+    }
+    bx = width - 64 - TG_GUI_EMOJI_BUTTON_W + (TG_GUI_EMOJI_BUTTON_W - side) / 2;
+    /* The visible input and Send button leave four pixels below the row. */
+    by = box_top + (input_h - 4 - side) / 2;
+    if (state->emoji_active) {
+        backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
+                           tg_gui_make_rect(bx - 2, by - 2, side + 4, side + 4));
+    }
+    idx = tg_gui_emoji_index_of(0x1f600UL);
+    if (idx < 0) {
+        idx = 0;
+    }
+    if (backend->glyph_image == 0 ||
+        !backend->glyph_image(backend, (unsigned long)idx, bx, by, side)) {
+        backend->draw_text(backend, TG_GUI_PEN_TEXT, bx, by + side - 2, ":)", 2UL);
+    }
+}
+
+/* Panel geometry from the same numbers the composer painter uses. Cells are
+   squares of the line height plus padding; the recents row, when there is
+   one, is the first row and the sheet follows. */
+typedef struct tg_gui_emoji_geom {
+    int cell;    /* cell side */
+    int cols;
+    int rows;    /* visible rows (recents row included) */
+    int x;
+    int y;
+    int w;
+    int h;
+    int recents; /* cells in the recents row (0 = no such row) */
+    int total;   /* cells addressable: recents + sheet */
+} tg_gui_emoji_geom;
+
+static void tg_gui_emoji_geometry(const tg_gui_state *state, int width,
+                                  int height, int lh, tg_gui_emoji_geom *geo)
+{
+    int sidebar_w = tg_gui_sidebar_w(width);
+    int sheet_rows;
+
+    /* A cell is at least the sheet's native 16 pixels: the panel is not
+       inline text, so a 9 pixel font must not shrink the pictures into
+       blobs. Fonts taller than that get proportionally larger cells. */
+    geo->cell = (lh > TG_EMOJI_GLYPH_SIZE ? lh : TG_EMOJI_GLYPH_SIZE) + 6;
+    geo->x = sidebar_w + 8;
+    geo->w = width - 16 - sidebar_w;
+    geo->cols = geo->w / geo->cell;
+    if (geo->cols < 4) {
+        geo->cols = 4;
+    }
+    if (geo->cols > 16) {
+        geo->cols = 16;
+    }
+    geo->w = geo->cols * geo->cell + 4;
+    geo->recents = state->emoji_recent_count > geo->cols
+                       ? geo->cols : state->emoji_recent_count;
+    geo->total = geo->recents + (int)tg_emoji_sheet_count;
+    sheet_rows = ((int)tg_emoji_sheet_count + geo->cols - 1) / geo->cols;
+    geo->rows = sheet_rows + (geo->recents > 0 ? 1 : 0);
+    /* Never taller than the window minus the composer and header. */
+    if (geo->rows * geo->cell + 4 > height - 3 * lh - 24) {
+        geo->rows = (height - 3 * lh - 24) / geo->cell;
+        if (geo->rows < 1) {
+            geo->rows = 1;
+        }
+    }
+    geo->h = geo->rows * geo->cell + 4;
+    /* Sits directly above the composer box (the box top is height - lh*3
+       - ... in the painter; the painter passes the real box top through
+       tg_gui_emoji_paint, this is the default for the hit test). */
+    geo->y = height - (lh + 12) - geo->h - 2;
+    if (geo->y < 0) {
+        geo->y = 0;
+    }
+}
+
+/* Cell index -> sheet glyph index. */
+static unsigned long tg_gui_emoji_cell_glyph(const tg_gui_state *state,
+                                             const tg_gui_emoji_geom *geo,
+                                             int cell)
+{
+    if (cell < geo->recents) {
+        return state->emoji_recent[cell];
+    }
+    return (unsigned long)(cell - geo->recents);
+}
+
+/* Row/column of a cell: the recents row is row 0 and is padded to `cols`. */
+static void tg_gui_emoji_cell_pos(const tg_gui_emoji_geom *geo, int cell,
+                                  int *row, int *col)
+{
+    if (geo->recents > 0 && cell < geo->recents) {
+        *row = 0;
+        *col = cell;
+        return;
+    }
+    cell -= geo->recents;
+    *row = cell / geo->cols + (geo->recents > 0 ? 1 : 0);
+    *col = cell % geo->cols;
+}
+
+/* The last painted window metrics, so keys and hit tests use the geometry
+   the user is looking at. Painter side state, hence not in tg_gui_state. */
+static int tg_gui_emoji_geom_w;
+static int tg_gui_emoji_geom_h;
+static int tg_gui_emoji_geom_lh;
+int tg_gui_emoji_geom_y; /* panel top as painted; the self-test reads it */
+
+void tg_gui_emoji_open(tg_gui_state *state)
+{
+    if (state == 0 || !state->emoji_enabled) {
+        return;
+    }
+    if (state->emoji_recent_count == 0) {
+        tg_gui_emoji_recent_load(state);
+    }
+    state->emoji_active = 1;
+    state->emoji_sel = 0;
+    state->composing = 1;
+    state->mention_active = 0;
+    state->mention_count = 0;
+}
+
+void tg_gui_emoji_close(tg_gui_state *state)
+{
+    if (state != 0) {
+        state->emoji_active = 0;
+    }
+}
+
+void tg_gui_emoji_move(tg_gui_state *state, int dx, int dy)
+{
+    tg_gui_emoji_geom geo;
+    int row;
+    int col;
+    int target;
+
+    if (state == 0 || !state->emoji_enabled || !state->emoji_active) {
+        return;
+    }
+    /* Geometry for a nominal window: only cols matters for movement, and
+       cols depends on the width the painter had; keep the last painted one
+       through a static so keys and paint agree. */
+    tg_gui_emoji_geometry(state, tg_gui_emoji_geom_w > 0 ? tg_gui_emoji_geom_w : 640,
+                          tg_gui_emoji_geom_h > 0 ? tg_gui_emoji_geom_h : 256,
+                          tg_gui_emoji_geom_lh > 0 ? tg_gui_emoji_geom_lh : 8,
+                          &geo);
+    if (geo.total <= 0) {
+        return;
+    }
+    tg_gui_emoji_cell_pos(&geo, state->emoji_sel, &row, &col);
+    if (dx != 0) {
+        target = state->emoji_sel + dx;
+    } else {
+        int trow = row + dy;
+
+        if (geo.recents > 0 && row == 1 && dy < 0) {
+            target = col < geo.recents ? col : geo.recents - 1;
+        } else if (geo.recents > 0 && row == 0 && dy > 0) {
+            target = geo.recents + col;
+        } else if (trow < 0) {
+            return;
+        } else {
+            target = state->emoji_sel + dy * geo.cols;
+        }
+    }
+    if (target < 0) {
+        target = 0;
+    }
+    if (target >= geo.total) {
+        target = geo.total - 1;
+    }
+    state->emoji_sel = target;
+}
+
+static void tg_gui_emoji_recent_push(tg_gui_state *state, unsigned long glyph)
+{
+    int i;
+    int at = -1;
+
+    for (i = 0; i < state->emoji_recent_count; ++i) {
+        if (state->emoji_recent[i] == glyph) {
+            at = i;
+            break;
+        }
+    }
+    if (at < 0) {
+        if (state->emoji_recent_count < TG_GUI_EMOJI_RECENT_MAX) {
+            at = state->emoji_recent_count++;
+        } else {
+            at = TG_GUI_EMOJI_RECENT_MAX - 1;
+        }
+    }
+    for (i = at; i > 0; --i) {
+        state->emoji_recent[i] = state->emoji_recent[i - 1];
+    }
+    state->emoji_recent[0] = (unsigned short)glyph;
+}
+
+int tg_gui_emoji_pick(tg_gui_state *state)
+{
+    tg_gui_emoji_geom geo;
+    unsigned long glyph;
+    int from_recents;
+
+    if (state == 0 || !state->emoji_enabled || !state->emoji_active) {
+        return 0;
+    }
+    tg_gui_emoji_geometry(state, tg_gui_emoji_geom_w > 0 ? tg_gui_emoji_geom_w : 640,
+                          tg_gui_emoji_geom_h > 0 ? tg_gui_emoji_geom_h : 256,
+                          tg_gui_emoji_geom_lh > 0 ? tg_gui_emoji_geom_lh : 8,
+                          &geo);
+    if (state->emoji_sel < 0 || state->emoji_sel >= geo.total) {
+        return 0;
+    }
+    glyph = tg_gui_emoji_cell_glyph(state, &geo, state->emoji_sel);
+    if (glyph >= tg_emoji_sheet_count ||
+        !tg_gui_composer_insert_emoji(state, glyph)) {
+        return 0;
+    }
+    from_recents = state->emoji_sel < geo.recents;
+    tg_gui_emoji_recent_push(state, glyph);
+    tg_gui_emoji_recent_save(state);
+    /* The recents row may have grown by one cell, which shifts every sheet
+       cell right by one: keep the highlight on the glyph that was picked, so
+       a second ENTER (or click) repeats it instead of taking its neighbour.
+       A pick from the recents row moved that glyph to the front. */
+    tg_gui_emoji_geometry(state, tg_gui_emoji_geom_w > 0 ? tg_gui_emoji_geom_w : 640,
+                          tg_gui_emoji_geom_h > 0 ? tg_gui_emoji_geom_h : 256,
+                          tg_gui_emoji_geom_lh > 0 ? tg_gui_emoji_geom_lh : 8,
+                          &geo);
+    state->emoji_sel = from_recents ? 0 : geo.recents + (int)glyph;
+    return 1;
+}
+
+int tg_gui_emoji_cell_at(const tg_gui_state *state, int width, int lh,
+                         int x, int y)
+{
+    tg_gui_emoji_geom geo;
+    int col;
+    int row;
+    int cell;
+
+    if (state == 0 || !state->emoji_enabled || !state->emoji_active) {
+        return -1;
+    }
+    /* The panel the user sees is the one the painter laid out: same width
+       and line height as that paint, and the top it actually drew at (the
+       composer box moves with the reply strip and the wrapped rows). */
+    if (tg_gui_emoji_geom_w > 0) {
+        width = tg_gui_emoji_geom_w;
+        lh = tg_gui_emoji_geom_lh;
+    }
+    tg_gui_emoji_geometry(state, width,
+                          tg_gui_emoji_geom_h > 0 ? tg_gui_emoji_geom_h : 256,
+                          lh, &geo);
+    if (tg_gui_emoji_geom_w > 0) {
+        geo.y = tg_gui_emoji_geom_y;
+    }
+    if (x < geo.x + 2 || y < geo.y + 2 || x >= geo.x + 2 + geo.cols * geo.cell ||
+        y >= geo.y + 2 + geo.rows * geo.cell) {
+        return -1;
+    }
+    col = (x - geo.x - 2) / geo.cell;
+    row = (y - geo.y - 2) / geo.cell;
+    if (geo.recents > 0) {
+        if (row == 0) {
+            return col < geo.recents ? col : -1;
+        }
+        cell = geo.recents + (row - 1) * geo.cols + col;
+    } else {
+        cell = row * geo.cols + col;
+    }
+    return cell < geo.total ? cell : -1;
+}
+
+void tg_gui_emoji_recent_load(tg_gui_state *state)
+{
+    FILE *f;
+    unsigned long v;
+
+    if (state == 0) {
+        return;
+    }
+    state->emoji_recent_count = 0;
+    f = fopen("data/telegram-emoji-recent.txt", "r");
+    if (f == 0) {
+        return;
+    }
+    while (state->emoji_recent_count < TG_GUI_EMOJI_RECENT_MAX &&
+           fscanf(f, "%lu", &v) == 1) {
+        if (v < tg_emoji_sheet_count) {
+            state->emoji_recent[state->emoji_recent_count++] =
+                (unsigned short)v;
+        }
+    }
+    fclose(f);
+}
+
+void tg_gui_emoji_recent_save(const tg_gui_state *state)
+{
+    FILE *f;
+    int i;
+
+    if (state == 0) {
+        return;
+    }
+    f = fopen("data/telegram-emoji-recent.txt", "w");
+    if (f == 0) {
+        return;
+    }
+    for (i = 0; i < state->emoji_recent_count; ++i) {
+        fprintf(f, "%u\n", (unsigned)state->emoji_recent[i]);
+    }
+    fclose(f);
+}
+
+/* Record exactly the opaque area that can cover a directly replayed photo. */
+static void tg_gui_popup_frame(tg_gui_backend *backend, int pen,
+                                tg_gui_rect rect)
+{
+    if (backend->popup_area != 0) {
+        backend->popup_area(backend, rect);
+    }
+    backend->fill_rect(backend, pen, rect);
+}
+
+/* The panel itself: accent frame, surface, one square per glyph, the
+   highlighted cell in the accent pen. Without a glyph primitive (the
+   recording backend) each cell shows a dot so geometry still exercises. */
+static void tg_gui_emoji_paint(const tg_gui_state *state,
+                               tg_gui_backend *backend,
+                               int width, int height, int lh, int box_top)
+{
+    tg_gui_emoji_geom geo;
+    int cell;
+
+    if (!state->emoji_enabled || !state->emoji_active) {
+        return;
+    }
+    tg_gui_emoji_geom_w = width;
+    tg_gui_emoji_geom_h = height;
+    tg_gui_emoji_geom_lh = lh;
+    tg_gui_emoji_geometry(state, width, height, lh, &geo);
+    geo.y = box_top - geo.h - 2;
+    if (state->reply_to_id != 0UL) {
+        geo.y -= (lh + 4 + TG_GUI_REPLY_LIFT);
+    }
+    if (geo.y < 0) {
+        geo.y = 0;
+    }
+    tg_gui_emoji_geom_y = geo.y;
+    tg_gui_popup_frame(backend, TG_GUI_PEN_ACCENT,
+                        tg_gui_make_rect(geo.x - 1, geo.y - 1, geo.w + 2,
+                                         geo.h + 2));
+    backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
+                       tg_gui_make_rect(geo.x, geo.y, geo.w, geo.h));
+    for (cell = 0; cell < geo.total; ++cell) {
+        int row;
+        int col;
+        int cx;
+        int cy;
+        unsigned long glyph;
+
+        tg_gui_emoji_cell_pos(&geo, cell, &row, &col);
+        if (row >= geo.rows) {
+            break;
+        }
+        cx = geo.x + 2 + col * geo.cell;
+        cy = geo.y + 2 + row * geo.cell;
+        if (cell == state->emoji_sel) {
+            backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
+                               tg_gui_make_rect(cx, cy, geo.cell, geo.cell));
+        }
+        glyph = tg_gui_emoji_cell_glyph(state, &geo, cell);
+        if (backend->glyph_image == 0 ||
+            !backend->glyph_image(backend, glyph, cx + 3, cy + 3,
+                                  geo.cell - 6)) {
+            backend->fill_rect(backend, TG_GUI_PEN_TEXT,
+                               tg_gui_make_rect(cx + geo.cell / 2 - 1,
+                                                cy + geo.cell / 2 - 1, 2, 2));
+        }
+    }
+    if (geo.recents > 0) {
+        /* a thin rule under the recents row */
+        backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
+                           tg_gui_make_rect(geo.x + 2, geo.y + 2 + geo.cell - 1,
+                                            geo.cols * geo.cell, 1));
+    }
+}
+
+/* The mention list and emoji panel are composed above the input row. */
+static void tg_gui_paint_popups_at(const tg_gui_state *state,
+                                   tg_gui_backend *backend, int width,
+                                   int height, int lh, int box_top)
+{
+    int sidebar_w = tg_gui_sidebar_w(width);
+
+    /* '@' mention popup: the candidate usernames above the composer (over the
+       reply strip when one is shown); the highlighted row is what ENTER/TAB
+       will insert. Same accent-frame + surface look as the context menu. */
+    if (state->composing && state->mention_active && state->mention_count > 0) {
+        int ih = lh + 4;
+        int n = state->mention_count;
+        int bw = 220;
+        int bh = (n * ih) + 4;
+        int bx = sidebar_w + 8;
+        int by = box_top - bh - 2;
+        int mi;
+
+        if (state->reply_to_id != 0UL) {
+            by -= (lh + 4 + TG_GUI_REPLY_LIFT); /* sit above the reply strip */
+        }
+        if (bx + bw > width - 8) {
+            bw = width - 8 - bx;
+        }
+        if (by < 0) {
+            by = 0;
+        }
+        tg_gui_popup_frame(backend, TG_GUI_PEN_ACCENT,
+                            tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
+        backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
+                           tg_gui_make_rect(bx, by, bw, bh));
+        for (mi = 0; mi < n; ++mi) {
+            int pen = TG_GUI_PEN_TEXT;
+            char row[TG_GUI_MENTION_LEN + 2];
+            unsigned long rl = 0UL;
+            const char *u = state->mention_items[mi];
+
+            if (mi == state->mention_sel) {
+                backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
+                                   tg_gui_make_rect(bx, by + 2 + (mi * ih),
+                                                    bw, ih));
+                pen = TG_GUI_PEN_ACCENT_TEXT;
+            }
+            row[rl++] = '@';
+            while (*u != '\0' && rl < sizeof(row) - 1UL) {
+                row[rl++] = *u++;
+            }
+            row[rl] = '\0';
+            backend->draw_text(backend, pen, bx + 8, by + 2 + (mi * ih) + lh,
+                               row, rl);
+        }
+    }
+    tg_gui_emoji_paint(state, backend, width, height, lh, box_top);
+}
+
 /* Draws just the bottom composer row: the input box (now wrapped to multiple
    lines for a long message, with the caret on the right line), the placeholder /
    idle text, and the Send button. Factored out so the caret blink can repaint
@@ -2276,6 +3073,7 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
     int input_h;
     int box_top;
     int rows;
+    int text_base;
 
     width = backend->width(backend);
     height = backend->height(backend);
@@ -2286,10 +3084,15 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
     status_h = lh + 6;
     content_h = height - status_h;
     sidebar_w = tg_gui_sidebar_w(width);
-    area_x = sidebar_w + 12;
+    area_x = sidebar_w + 12 + TG_GUI_ATTACH_BUTTON_W;
     rows = tg_gui_input_rows(state, backend, width, sidebar_w);
     input_h = (rows * lh) + 14;
     box_top = content_h - input_h;
+    /* Centre the glyph cells, including their descenders. The first row has
+       the same top padding at every wrap count; later rows add only leading.
+       A baseline derived from lh alone sat low with tall MorphOS fonts. */
+    text_base = tg_gui_centred_baseline(backend, box_top,
+                                        lh - 2 + 2 * TG_GUI_INPUT_TEXT_PAD);
 
     /* When replying, a dim header strip sits ABOVE the box (the box itself does
        not move -- tg_gui_input_h reserved the extra line so the transcript
@@ -2332,6 +3135,7 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
     backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
                        tg_gui_make_rect(sidebar_w + 8, box_top,
                                         width - sidebar_w - 16, input_h - 4));
+    tg_gui_paint_attach_button(backend, sidebar_w, box_top, input_h);
     if (state->input[0] != '\0') {
         unsigned long starts[TG_GUI_WRAP_MAX_LINES];
         unsigned long lengths[TG_GUI_WRAP_MAX_LINES];
@@ -2340,7 +3144,7 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
         int k;
 
         n = tg_gui_wrap(backend, state->input,
-                        tg_gui_input_text_w(width, sidebar_w), starts, lengths,
+                        tg_gui_input_text_w(state, width, sidebar_w), starts, lengths,
                         TG_GUI_WRAP_MAX_LINES);
         if (n < 1) {
             n = 1;
@@ -2382,14 +3186,15 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
                     backend->fill_rect(
                         backend, TG_GUI_PEN_SELECT,
                         tg_gui_make_rect(x0,
-                                         box_top + ((k - first) * lh) + 4,
-                                         sw, lh));
+                                         box_top + ((k - first) * lh) +
+                                             TG_GUI_INPUT_TEXT_PAD,
+                                         sw, lh - 2));
                 }
             }
         }
         for (k = first; k < n && (k - first) < rows; ++k) {
             backend->draw_text(backend, TG_GUI_PEN_TEXT, area_x,
-                               box_top + ((k - first) * lh) + lh + 2,
+                               text_base + ((k - first) * lh),
                                state->input + starts[k], lengths[k]);
         }
         if (state->composing && state->cursor_on) {
@@ -2419,70 +3224,29 @@ static void tg_gui_paint_input_row(const tg_gui_state *state,
                           1;
                 /* Same baseline the line's text was drawn from, just above. */
                 tg_gui_draw_caret(backend, TG_GUI_PEN_TEXT, caret_x,
-                                  box_top + ((line - first) * lh) + lh + 2);
+                                  text_base + ((line - first) * lh));
             }
         }
     } else if (state->composing) {
         if (state->cursor_on) {
             /* Empty composer: the baseline the first typed line will use. */
             tg_gui_draw_caret(backend, TG_GUI_PEN_TEXT, area_x,
-                              box_top + lh + 2);
+                              text_base);
         }
     } else {
         backend->draw_text(backend, TG_GUI_PEN_TEXT_DIM, area_x,
-                           box_top + lh + 2, "Write a message...", 18UL);
+                           text_base, "Write a message...", 18UL);
     }
     backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
                        tg_gui_make_rect(width - 64, box_top, 56, input_h - 4));
     backend->draw_text(backend, TG_GUI_PEN_ACCENT_TEXT, width - 56,
-                       box_top + lh + 2, "Send", 4UL);
-
-    /* '@' mention popup: the candidate usernames above the composer (over the
-       reply strip when one is shown); the highlighted row is what ENTER/TAB
-       will insert. Same accent-frame + surface look as the context menu. */
-    if (state->composing && state->mention_active && state->mention_count > 0) {
-        int ih = lh + 4;
-        int n = state->mention_count;
-        int bw = 220;
-        int bh = (n * ih) + 4;
-        int bx = sidebar_w + 8;
-        int by = box_top - bh - 2;
-        int mi;
-
-        if (state->reply_to_id != 0UL) {
-            by -= (lh + 4 + TG_GUI_REPLY_LIFT); /* sit above the reply strip */
-        }
-        if (bx + bw > width - 8) {
-            bw = width - 8 - bx;
-        }
-        if (by < 0) {
-            by = 0;
-        }
-        backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
-                           tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
-        backend->fill_rect(backend, TG_GUI_PEN_SURFACE,
-                           tg_gui_make_rect(bx, by, bw, bh));
-        for (mi = 0; mi < n; ++mi) {
-            int pen = TG_GUI_PEN_TEXT;
-            char row[TG_GUI_MENTION_LEN + 2];
-            unsigned long rl = 0UL;
-            const char *u = state->mention_items[mi];
-
-            if (mi == state->mention_sel) {
-                backend->fill_rect(backend, TG_GUI_PEN_ACCENT,
-                                   tg_gui_make_rect(bx, by + 2 + (mi * ih),
-                                                    bw, ih));
-                pen = TG_GUI_PEN_ACCENT_TEXT;
-            }
-            row[rl++] = '@';
-            while (*u != '\0' && rl < sizeof(row) - 1UL) {
-                row[rl++] = *u++;
-            }
-            row[rl] = '\0';
-            backend->draw_text(backend, pen, bx + 8, by + 2 + (mi * ih) + lh,
-                               row, rl);
-        }
+                       tg_gui_centred_baseline(backend, box_top, input_h - 4),
+                       "Send", 4UL);
+    if (state->emoji_enabled) {
+        tg_gui_paint_emoji_button(state, backend, width, box_top, input_h);
     }
+
+    tg_gui_paint_popups_at(state, backend, width, height, lh, box_top);
 }
 
 /* The floating "scroll to newest" button: an accent square with a filled
@@ -2568,7 +3332,7 @@ static void tg_gui_paint_main(const tg_gui_state *state,
         ((tg_gui_state *)state)->sel_press_char = -1;
     }
 
-    header_h = lh + 10;
+    header_h = 3 * tg_gui_native_line_height(backend) + 14;
     /* The open chat's avatar sits before the title, same drawing as its
        sidebar row (real image first, initials square as the fallback), so
        the header answers "which chat am I in" the way the desktop client
@@ -2576,19 +3340,22 @@ static void tg_gui_paint_main(const tg_gui_state *state,
        the login/cached states keep their plain layout. */
     {
         int text_x = area_x;
+        int slot_h = tg_gui_native_line_height(backend) + 6;
+        int text_top = (header_h - 2 * slot_h) / 2;
 
         if (state->selected_chat >= 0 &&
             state->selected_chat < state->chat_count) {
             const tg_gui_chat *open_chat = &state->chats[state->selected_chat];
-            int av = (2 * lh) - 2;
+            int av = tg_gui_avatar_size(backend, 1);
+            int av_y = (header_h - av) / 2;
 
             backend->round_bg = TG_GUI_PEN_WINDOW;
             if (backend->avatar_image == 0 ||
                 !backend->avatar_image(backend, open_chat->peer_id_hi,
                                        open_chat->peer_id_lo,
-                                       tg_gui_make_rect(area_x, 4, av, av))) {
+                                       tg_gui_make_rect(area_x, av_y, av, av))) {
                 backend->avatar_fill(backend, open_chat->avatar_color,
-                                     tg_gui_make_rect(area_x, 4, av, av));
+                                     tg_gui_make_rect(area_x, av_y, av, av));
                 {
                     unsigned long ilen =
                         (unsigned long)strlen(open_chat->initials);
@@ -2600,24 +3367,29 @@ static void tg_gui_paint_main(const tg_gui_state *state,
                         ix = area_x;
                     }
                     backend->draw_text(backend, TG_GUI_PEN_TEXT, ix,
-                                       tg_gui_centred_baseline(backend, 4, av),
+                                       tg_gui_navigation_baseline(backend, av_y, av),
                                        open_chat->initials, ilen);
                 }
             }
             text_x = area_x + av + 8;
         }
-        tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT, text_x, lh + 2,
+        tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT, text_x,
+                            tg_gui_navigation_baseline(backend, text_top, slot_h),
                             state->title, area_w - (text_x - area_x));
         /* While the peer is typing, the second header line shows "X is
            typing..." in the accent colour instead of the static subtitle
            (Telegram's cue). */
         if (state->typing[0] != '\0') {
             tg_gui_draw_clipped(backend, TG_GUI_PEN_ACCENT, text_x,
-                                header_h + lh - 2, state->typing,
+                                tg_gui_navigation_baseline(backend, text_top + slot_h,
+                                                           slot_h),
+                                state->typing,
                                 area_w - (text_x - area_x));
         } else {
             tg_gui_draw_clipped(backend, TG_GUI_PEN_TEXT_DIM, text_x,
-                                header_h + lh - 2, state->subtitle,
+                                tg_gui_navigation_baseline(backend, text_top + slot_h,
+                                                           slot_h),
+                                state->subtitle,
                                 area_w - (text_x - area_x));
         }
     }
@@ -2626,9 +3398,8 @@ static void tg_gui_paint_main(const tg_gui_state *state,
     ((tg_gui_state *)state)->input_h = input_h; /* cache for the hit-test */
     transcript_bottom = content_h - input_h - 4;
 
-    /* One full line below the subtitle baseline so the first incoming bubble's
-       sender name clears the header at any font size. */
-    y = header_h + (2 * lh) + 4;
+    /* Both header lines and their emoji fit above this stable boundary. */
+    y = header_h;
     transcript_top = y;
     /* Pixel-granular transcript scroll: transcript_scroll is a PIXEL offset up
        from the newest-pinned position (0 = newest pinned to the bottom). This
@@ -2820,6 +3591,7 @@ int tg_gui_chat_drop_target(const tg_gui_state *state, int lh, int y)
     if (state == 0) {
         return 0;
     }
+    lh = tg_gui_navigation_line_height(state, lh);
     search_h = lh + 10;       /* keep in sync with tg_gui_paint_sidebar */
     row_h = (2 * lh) + 12;
     if (row_h < 1) {
@@ -3037,6 +3809,13 @@ int tg_gui_selection_get(const tg_gui_state *state, char *out,
 int tg_gui_hit_test(const tg_gui_state *state, int width, int height, int lh,
                     int x, int y)
 {
+    if (state != 0 && state->emoji_active) {
+        int ecell = tg_gui_emoji_cell_at(state, width, lh, x, y);
+
+        if (ecell >= 0) {
+            return TG_GUI_HIT_EMOJI_BASE + ecell;
+        }
+    }
     int sidebar_w;
     int status_h;
     int content_h;
@@ -3060,6 +3839,14 @@ int tg_gui_hit_test(const tg_gui_state *state, int width, int height, int lh,
             }
             return TG_GUI_HIT_INPUT;
         }
+        if (state->emoji_enabled &&
+            x >= width - 64 - TG_GUI_EMOJI_BUTTON_W && x < width - 64) {
+            return TG_GUI_HIT_EMOJI_BUTTON;
+        }
+        if (x >= sidebar_w + 8 &&
+            x < sidebar_w + 8 + TG_GUI_ATTACH_BUTTON_W) {
+            return TG_GUI_HIT_ATTACH_BUTTON;
+        }
         if (x >= width - 64) {
             return TG_GUI_HIT_SEND;
         }
@@ -3069,9 +3856,10 @@ int tg_gui_hit_test(const tg_gui_state *state, int width, int height, int lh,
     if (x >= 0 && x < sidebar_w && y >= 0 && y < content_h) {
         int search_h;
         int row_h;
+        int nav_lh = tg_gui_navigation_line_height(state, lh);
 
-        search_h = lh + 10;
-        row_h = (2 * lh) + 12;
+        search_h = nav_lh + 10;
+        row_h = (2 * nav_lh) + 12;
         if (y >= search_h) {
             int row;
 
@@ -3281,6 +4069,20 @@ static void tg_gui_paint_login(const tg_gui_state *state,
     }
     tg_gui_draw_centered(backend, TG_GUI_PEN_TEXT_DIM, width, mid + (3 * lh),
                          "ENTER confirms   ESC quits");
+    if (state->mode == TG_GUI_MODE_LOGIN_CODE) {
+        /* When Telegram named another route, say how to ask for it: the
+           in-app code does not always show up, and the official apps offer
+           the same way out after a wait. */
+        const char *route = tg_mtproto_sent_code_next_route();
+
+        if (route != 0) {
+            char hint[64];
+
+            sprintf(hint, "No code? Press S to get it %.24s", route);
+            tg_gui_draw_centered(backend, TG_GUI_PEN_TEXT_DIM, width,
+                                 mid + (4 * lh) + 2, hint);
+        }
+    }
     if (!tg_gui_first_paint_logged) {
         tg_gui_log("login paint: done");
         tg_gui_first_paint_logged = 1;
@@ -3388,20 +4190,87 @@ static int tg_gui_context_items(const tg_gui_state *state, const char **labels,
     return n;
 }
 
+int tg_gui_attachment_is_photo(const char *path)
+{
+    const char *dot;
+    const char *p;
+    char ext[6];
+    int n;
+
+    if (path == 0) {
+        return 0;
+    }
+    dot = 0;
+    for (p = path; *p != '\0'; ++p) {
+        if (*p == '/' || *p == ':') {
+            dot = 0;
+        } else if (*p == '.') {
+            dot = p;
+        }
+    }
+    if (dot == 0) {
+        return 0;
+    }
+    n = 0;
+    while (dot[n] != '\0' && n < 5) {
+        char c;
+
+        c = dot[n];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+        ext[n++] = c;
+    }
+    ext[n] = '\0';
+    if (dot[n] != '\0') {
+        return 0;
+    }
+    return strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0 ||
+           strcmp(ext, ".png") == 0;
+}
+
 int tg_gui_photo_default_filename(char *out, unsigned long out_size,
                                   unsigned long photo_id_hi,
-                                  unsigned long photo_id_lo)
+                                  unsigned long photo_id_lo,
+                                  const char *source_path)
 {
+    static const unsigned char png_magic[8] = {
+        0x89U, 'P', 'N', 'G', 13U, 10U, 26U, 10U
+    };
+    FILE *file;
+    unsigned char magic[8];
+    size_t got;
+    const char *extension;
     unsigned long short_id;
     char name[40];
     unsigned long length;
 
-    if (out == 0 || out_size == 0UL ||
-        (photo_id_hi == 0UL && photo_id_lo == 0UL)) {
+    if (out == 0 || out_size == 0UL) {
+        return 1;
+    }
+    out[0] = '\0';
+    if (source_path == 0 || (photo_id_hi == 0UL && photo_id_lo == 0UL)) {
+        return 1;
+    }
+    /* Telegram can re-encode an uploaded PNG. Name the bytes we actually
+       received, never the upload's name or the internal cache suffix. */
+    file = fopen(source_path, "rb");
+    if (file == 0) {
+        return 1;
+    }
+    got = fread(magic, 1, sizeof(magic), file);
+    fclose(file);
+    if (got == sizeof(magic) && memcmp(magic, png_magic, sizeof(magic)) == 0) {
+        extension = "png";
+    } else if (got >= 3U && magic[0] == 0xffU && magic[1] == 0xd8U &&
+               magic[2] == 0xffU) {
+        extension = "jpg";
+    } else {
         return 1;
     }
     short_id = photo_id_lo != 0UL ? photo_id_lo : photo_id_hi;
-    sprintf(name, "photo-%08lx.jpg", short_id);
+    short_id &= 0xffffffffUL;
+    sprintf(name, "photo-%08lx.%.3s", short_id, extension);
     length = (unsigned long)strlen(name);
     if (length + 1UL > out_size) {
         out[0] = '\0';
@@ -3532,8 +4401,8 @@ static void tg_gui_paint_context_menu(const tg_gui_state *state,
     /* System menu colours (0.0.8): the popup now matches the new-look
        menubar instead of the dark chat theme -- outline, background, text
        and the hover highlight all come from the screen's own pens. */
-    backend->fill_rect(backend, TG_GUI_PEN_MENU_FRAME,
-                       tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
+    tg_gui_popup_frame(backend, TG_GUI_PEN_MENU_FRAME,
+                        tg_gui_make_rect(bx - 1, by - 1, bw + 2, bh + 2));
     backend->fill_rect(backend, TG_GUI_PEN_MENU_BACK,
                        tg_gui_make_rect(bx, by, bw, bh));
     for (i = 0; i < n; ++i) {
@@ -3668,7 +4537,8 @@ void tg_gui_paint(const tg_gui_state *state, tg_gui_backend *backend)
     if (!tg_gui_first_paint_logged) {
         tg_gui_log("chat paint: sidebar");
     }
-    tg_gui_paint_sidebar(state, backend, sidebar_w, content_h, lh);
+    ((tg_gui_state *)state)->nav_lh = tg_gui_native_line_height(backend);
+    tg_gui_paint_sidebar(state, backend, sidebar_w, content_h, state->nav_lh);
     if (!tg_gui_first_paint_logged) {
         tg_gui_log("chat paint: main");
     }
@@ -3696,6 +4566,23 @@ void tg_gui_paint(const tg_gui_state *state, tg_gui_backend *backend)
 typedef struct tg_gui_record {
     int width;
     int height;
+    int line_h;
+    int ascent;
+    int font_h;
+    int first_text_x;
+    int first_text_y;
+    tg_gui_rect first_avatar;
+    tg_gui_rect second_avatar;
+    tg_gui_rect last_avatar;
+    const char *watch_text[5];
+    int watch_y[5];
+    int watch_hits[5];
+    const tg_gui_state *link_state;
+    const char *link_text;
+    unsigned long link_chars;
+    int link_msg;
+    int link_bad_hits;
+    int avatar_images;
     int fills;
     int avatars;
     int photos;
@@ -3706,6 +4593,11 @@ typedef struct tg_gui_record {
     int photo_last_w;
     int photo_last_h;
     int texts;
+    int glyphs; /* emoji glyph cells drawn through glyph_image */
+    tg_gui_rect popup_rects[3];
+    int popup_count;
+    int popup_pending;
+    int popup_frames;
     int min_x;
     int min_y;
     int max_x;
@@ -3728,17 +4620,51 @@ static int tg_gui_rec_height(tg_gui_backend *backend)
 
 static int tg_gui_rec_line_height(tg_gui_backend *backend)
 {
-    (void)backend;
-    return 10;
+    int h = ((tg_gui_record *)backend->context)->line_h;
+
+    return h > 0 ? h : 10;
+}
+
+static int tg_gui_rec_ascent(tg_gui_backend *backend)
+{
+    return ((tg_gui_record *)backend->context)->ascent;
+}
+
+static int tg_gui_rec_font_height(tg_gui_backend *backend)
+{
+    return ((tg_gui_record *)backend->context)->font_h;
+}
+
+#define TG_GUI_REC_EMOJI_CELL 12
+static int tg_gui_rec_glyph(tg_gui_backend *backend, unsigned long index,
+                            int x, int y_top, int size)
+{
+    tg_gui_record *record = (tg_gui_record *)backend->context;
+
+    (void)index; (void)x; (void)y_top; (void)size;
+    record->glyphs += 1;
+    return 1;
 }
 
 static int tg_gui_rec_text_width(tg_gui_backend *backend, const char *text,
                                  unsigned long length)
 {
+    unsigned long i;
+    int w = 0;
+
     (void)backend;
-    (void)text;
-    return (int)(length * 6UL);
+    for (i = 0UL; i < length; ) {
+        if (tg_gui_emoji_pair_at(text, length, i, 0)) {
+            w += TG_GUI_REC_EMOJI_CELL;
+            i += 2UL;
+        } else {
+            w += 6;
+            i += 1UL;
+        }
+    }
+    return w;
 }
+
 
 static void tg_gui_rec_track(tg_gui_record *record, int x, int y)
 {
@@ -3762,6 +4688,14 @@ static void tg_gui_rec_fill(tg_gui_backend *backend, int pen, tg_gui_rect rect)
 
     record = (tg_gui_record *)backend->context;
     record->fills += 1;
+    if (record->popup_pending && record->popup_count <= 3) {
+        tg_gui_rect p = record->popup_rects[record->popup_count - 1];
+
+        if (p.x == rect.x && p.y == rect.y && p.w == rect.w && p.h == rect.h) {
+            ++record->popup_frames;
+        }
+        record->popup_pending = 0;
+    }
     /* The read double-check is the only thing drawn in the azure READ pen, so a
        fill in that pen proves the receipt mark rendered (its many tick segments
        just set the flag idempotently). */
@@ -3772,6 +4706,17 @@ static void tg_gui_rec_fill(tg_gui_backend *backend, int pen, tg_gui_rect rect)
     tg_gui_rec_track(record, rect.x + rect.w, rect.y + rect.h);
 }
 
+static void tg_gui_rec_popup(tg_gui_backend *backend, tg_gui_rect rect)
+{
+    tg_gui_record *record = (tg_gui_record *)backend->context;
+
+    if (record->popup_count < 3) {
+        record->popup_rects[record->popup_count] = rect;
+    }
+    ++record->popup_count;
+    record->popup_pending = 1;
+}
+
 static void tg_gui_rec_avatar(tg_gui_backend *backend, int color_index,
                               tg_gui_rect rect)
 {
@@ -3779,9 +4724,28 @@ static void tg_gui_rec_avatar(tg_gui_backend *backend, int color_index,
 
     (void)color_index;
     record = (tg_gui_record *)backend->context;
+    if (record->avatars == 0) {
+        record->first_avatar = rect;
+    } else if (record->avatars == 1) {
+        record->second_avatar = rect;
+    }
+    record->last_avatar = rect;
     record->avatars += 1;
     tg_gui_rec_track(record, rect.x, rect.y);
     tg_gui_rec_track(record, rect.x + rect.w, rect.y + rect.h);
+}
+
+static int tg_gui_rec_avatar_image(tg_gui_backend *backend,
+                                   unsigned long peer_id_hi,
+                                   unsigned long peer_id_lo, tg_gui_rect rect)
+{
+    tg_gui_record *record = (tg_gui_record *)backend->context;
+
+    (void)peer_id_hi;
+    (void)peer_id_lo;
+    record->avatar_images += 1;
+    tg_gui_rec_avatar(backend, 0, rect);
+    return 1;
 }
 
 static int tg_gui_rec_photo(tg_gui_backend *backend,
@@ -3823,10 +4787,51 @@ static void tg_gui_rec_text(tg_gui_backend *backend, int pen, int x,
                             unsigned long length)
 {
     tg_gui_record *record;
+    int w;
 
     (void)pen;
     record = (tg_gui_record *)backend->context;
+    if (record->texts == 0) {
+        record->first_text_x = x;
+        record->first_text_y = baseline;
+    }
     record->texts += 1;
+    if (record->link_text != 0 &&
+        (pen == TG_GUI_PEN_LINK || pen == TG_GUI_PEN_READ)) {
+        unsigned long i;
+
+        /* Exercise the click path from the actual drawn glyph coordinates,
+           including every continuation of a wrapped URL below its picture. */
+        for (i = 0UL; i < length; ++i) {
+            char url[TG_GUI_MSG_TEXT_MAX + 8];
+            int px = x + backend->text_width(backend, text, i) + 3;
+            int py = baseline - 2;
+            long ch = tg_gui_transcript_char_at(
+                record->link_state, backend, record->line_h,
+                record->link_msg, px, py);
+
+            if (record->link_chars >= strlen(record->link_text) ||
+                text[i] != record->link_text[record->link_chars] ||
+                tg_gui_hit_test(record->link_state, record->width,
+                                 record->height, record->line_h, px, py) !=
+                    TG_GUI_HIT_MESSAGE_BASE - record->link_msg ||
+                !tg_gui_url_at(&record->link_state->messages[record->link_msg],
+                                ch, url, sizeof(url)) ||
+                strcmp(url, record->link_text) != 0) {
+                ++record->link_bad_hits;
+            }
+            ++record->link_chars;
+        }
+    }
+    for (w = 0; w < 5; ++w) {
+        const char *watched = record->watch_text[w];
+
+        if (watched != 0 && length == (unsigned long)strlen(watched) &&
+            memcmp(text, watched, length) == 0) {
+            record->watch_y[w] = baseline;
+            ++record->watch_hits[w];
+        }
+    }
     /* The read receipt is no longer text -- it is drawn as ticks in the READ pen
        and counted in tg_gui_rec_fill. */
     /* Guard that a forbidden string (a masked password) never reaches draw. */
@@ -3881,7 +4886,10 @@ int tg_gui_self_test(void)
     backend.height = tg_gui_rec_height;
     backend.line_height = tg_gui_rec_line_height;
     backend.font_ascent = 0; /* recorder: exercise the renderer's fallback */
+    backend.font_height = 0;
+    backend.popup_area = 0;
     backend.text_width = tg_gui_rec_text_width;
+    backend.glyph_image = tg_gui_rec_glyph;
     backend.fill_rect = tg_gui_rec_fill;
     backend.avatar_image = 0;
     backend.photo_image = tg_gui_rec_photo;
@@ -4078,6 +5086,80 @@ int tg_gui_self_test(void)
     backend.avatar_fill = tg_gui_rec_avatar;
     backend.draw_text = tg_gui_rec_text;
     backend.set_style = 0; /* recorder renders plain; markers are just skipped */
+    /* Literal URL punctuation must count towards the click target, even
+       when a photo, reply or sender band precedes the body. Narrow windows
+       force the URL across lines; emoji on/off changes the text line height. */
+    {
+        static tg_gui_state draft;
+        const char *url = "https://example.org/a_b*c~d_e*f~g_h*i~j_image.png";
+        int narrow;
+        int enabled;
+        int photos;
+        int kind;
+
+        for (narrow = 0; narrow <= 1; ++narrow) {
+            for (enabled = 0; enabled <= 1; ++enabled) {
+                for (photos = 0; photos <= 1; ++photos) {
+                    for (kind = 0; kind < 3; ++kind) {
+                        tg_gui_record rec;
+                        tg_gui_backend b = backend;
+                        tg_gui_message *m;
+                        int mi = kind == 2 ? 1 : 0;
+
+                        memset(&rec, 0, sizeof(rec));
+                        tg_gui_demo_state(&draft);
+                        memset(draft.messages, 0, sizeof(draft.messages));
+                        draft.message_count = mi + 1;
+                        draft.selected_msg = -1;
+                        draft.inline_photos = photos;
+                        draft.emoji_enabled = enabled;
+                        m = &draft.messages[mi];
+                        m->id = 2UL;
+                        m->is_own = kind == 1;
+                        strcpy(m->sender, "Example");
+                        strcpy(m->text, "*See* ");
+                        strcat(m->text, url);
+                        strcat(m->text, "\n[Link: Example - Image]\nDescription.");
+                        strcpy(m->reply_text, "Earlier message");
+                        m->has_photo = 1;
+                        m->photo_ready = 1;
+                        m->photo_width = 320UL;
+                        m->photo_height = 180UL;
+                        if (mi == 1) {
+                            draft.messages[0].id = 1UL;
+                            strcpy(draft.messages[0].sender, "Example");
+                            strcpy(draft.messages[0].text, "Earlier message");
+                        }
+                        rec.width = narrow ? 480 : 1280;
+                        rec.height = 720;
+                        rec.font_h = 8;
+                        rec.line_h = tg_gui_font_line_height(&draft, 8);
+                        rec.ascent = tg_gui_font_cell_ascent(&draft, 8, 6);
+                        rec.link_state = &draft;
+                        rec.link_msg = mi;
+                        rec.link_text = url;
+                        b.context = &rec;
+                        b.font_ascent = tg_gui_rec_ascent;
+                        b.font_height = tg_gui_rec_font_height;
+                        tg_gui_paint(&draft, &b);
+                        if (rec.link_bad_hits != 0 ||
+                            rec.link_chars != strlen(url)) {
+                            puts("gui self-test: drawn URL glyph did not open its link");
+                            return 2;
+                        }
+                        if (draft.photo_w[mi] <= 0 || draft.photo_h[mi] <= 0 ||
+                            tg_gui_hit_test(&draft, rec.width, rec.height,
+                                             rec.line_h, draft.photo_x[mi] + 2,
+                                             draft.photo_y[mi] + 2) !=
+                                TG_GUI_HIT_PHOTO_BASE - mi) {
+                            puts("gui self-test: URL click stole the picture target");
+                            return 2;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /* Every server-backed message exposes both forwarding actions. Pin the
        context-menu capacity and IDs so adding another conditional item cannot
@@ -4160,11 +5242,30 @@ int tg_gui_self_test(void)
     /* Save-as naming/path joining is platform-neutral. Existing destinations
        are rejected until the requester explicitly confirms replacement. */
     {
+        static const unsigned char jpeg_header[] = { 0xffU, 0xd8U, 0xffU };
+        static const unsigned char png_header[] = {
+            0x89U, 'P', 'N', 'G', 13U, 10U, 26U, 10U
+        };
+        const char *fixture = "tg-photo-name-selftest.png";
+        FILE *file;
         char name[40];
         char path[80];
+        int named;
 
-        if (tg_gui_photo_default_filename(name, sizeof(name), 0x11UL,
-                                          0x1234UL) != 0 ||
+        /* A JPEG under a .png name must still be suggested as .jpg. */
+        file = fopen(fixture, "wb");
+        if (file == 0) {
+            return 2;
+        }
+        named = fwrite(jpeg_header, 1, sizeof(jpeg_header), file) ==
+                sizeof(jpeg_header);
+        if (fclose(file) != 0) {
+            named = 0;
+        }
+        named = named && tg_gui_photo_default_filename(
+                            name, sizeof(name), 0x11UL, 0x1234UL, fixture) == 0;
+        (void)remove(fixture);
+        if (!named ||
             strcmp(name, "photo-00001234.jpg") != 0 ||
             tg_gui_photo_build_destination(path, sizeof(path),
                                            "RAM:Downloads", name) != 0 ||
@@ -4176,6 +5277,42 @@ int tg_gui_self_test(void)
             !tg_gui_photo_save_allowed(1, 1) ||
             !tg_gui_photo_save_allowed(0, 0)) {
             puts("gui self-test: photo save-as path policy mismatch");
+            return 2;
+        }
+        /* Cache names currently end in .jpg. A PNG keeps its actual format,
+           including after a fresh fetch; a missing/unknown header is refused. */
+        fixture = "tg-photo-name-selftest.jpg";
+        file = fopen(fixture, "wb");
+        if (file == 0) {
+            return 2;
+        }
+        named = fwrite(png_header, 1, sizeof(png_header), file) ==
+                sizeof(png_header);
+        if (fclose(file) != 0) {
+            named = 0;
+        }
+        named = named && tg_gui_photo_default_filename(
+                            name, sizeof(name), 0x11UL, 0x1234UL, fixture) == 0;
+        if (!named || strcmp(name, "photo-00001234.png") != 0 ||
+            tg_gui_photo_default_filename(name, 5UL, 0x11UL, 0x1234UL,
+                                           fixture) == 0 || name[0] != '\0') {
+            (void)remove(fixture);
+            puts("gui self-test: PNG save-as format mismatch");
+            return 2;
+        }
+        file = fopen(fixture, "wb");
+        if (file == 0) {
+            return 2;
+        }
+        (void)fwrite(png_header, 1, 7U, file);
+        fclose(file);
+        named = tg_gui_photo_default_filename(name, sizeof(name), 0x11UL,
+                                               0x1234UL, fixture);
+        (void)remove(fixture);
+        if (named == 0 || name[0] != '\0' ||
+            tg_gui_photo_default_filename(name, sizeof(name), 0x11UL,
+                                           0x1234UL, fixture) == 0) {
+            puts("gui self-test: unknown/missing photo got a format");
             return 2;
         }
     }
@@ -4256,6 +5393,205 @@ int tg_gui_self_test(void)
             return 2;
         }
 
+        /* 0.0.93: emoji pairs. Encode and decode round-trip every glyph index,
+           '@' is never an index byte, the wrap never splits a pair on a forced
+           break, the recording backend measures a pair as one cell, and the
+           composer insert puts the two bytes at the caret. */
+        {
+            unsigned long k;
+            unsigned long back;
+            char pair[2];
+            char text[40];
+            unsigned long starts[TG_GUI_WRAP_MAX_LINES];
+            unsigned long lengths[TG_GUI_WRAP_MAX_LINES];
+            int lines;
+            int l;
+
+            for (k = 0UL; k < TG_GUI_EMOJI_MAX; ++k) {
+                if (!tg_gui_emoji_encode(k, pair) || pair[1] == '@' ||
+                    !tg_gui_emoji_pair_at(pair, 2UL, 0UL, &back) || back != k) {
+                    printf("gui self-test: emoji pair %lu does not round-trip\n", k);
+                    return 2;
+                }
+            }
+            if (tg_gui_emoji_encode(TG_GUI_EMOJI_MAX, pair) ||
+                tg_gui_emoji_pair_at("\x80@", 2UL, 0UL, &back) ||
+                tg_gui_emoji_pair_at("a\x80", 2UL, 1UL, &back)) {
+                puts("gui self-test: emoji pair accepted out of range");
+                return 2;
+            }
+            /* 7 letters then a pair, no spaces, in 8 cells of 6 px: the forced
+               break must land BEFORE the pair, never inside it. */
+            tg_gui_emoji_encode(5UL, pair);
+            memcpy(text, "abcdefg", 7);
+            text[7] = pair[0]; text[8] = pair[1]; text[9] = 'h'; text[10] = '\0';
+            lines = tg_gui_wrap(&backend, text, 8 * 6 + 1, starts, lengths,
+                                TG_GUI_WRAP_MAX_LINES);
+            for (l = 0; l < lines; ++l) {
+                unsigned long e = starts[l] + lengths[l];
+
+                if (e > 0UL && e <= 10UL &&
+                    tg_gui_emoji_pair_at(text, 10UL, e - 1UL, 0)) {
+                    puts("gui self-test: wrap split an emoji pair");
+                    return 2;
+                }
+            }
+            if (tg_gui_rec_text_width(&backend, text, 10UL) !=
+                8 * 6 + TG_GUI_REC_EMOJI_CELL) {
+                puts("gui self-test: recording width of a pair");
+                return 2;
+            }
+            strcpy(state.input, "ab");
+            state.input_caret = 1;
+            if (!tg_gui_composer_insert_emoji(&state, 5UL) ||
+                state.input_caret != 3 || strlen(state.input) != 4UL ||
+                state.input[0] != 'a' || state.input[3] != 'b' ||
+                !tg_gui_emoji_pair_at(state.input, 4UL, 1UL, &back) || back != 5UL) {
+                puts("gui self-test: composer emoji insert");
+                return 2;
+            }
+            state.input[0] = '\0';
+            state.input_caret = 0;
+        }
+
+        /* 0.0.93: the emoji picker paints inside the window with one glyph per
+           cell, the arrows move the highlight, ENTER inserts and puts the
+           glyph at the front of the recents, and a click on a cell hits it. */
+        {
+            tg_gui_record em_record;
+            int before;
+            int hit;
+
+            state.composing = 1;
+            state.input[0] = '\0';
+            state.input_caret = 0;
+            state.emoji_recent_count = 0;
+            tg_gui_emoji_open(&state);
+            memset(&em_record, 0, sizeof(em_record));
+            em_record.width = 480;
+            em_record.height = 320;
+            em_record.min_x = em_record.width;
+            em_record.min_y = em_record.height;
+            backend.context = &em_record;
+            tg_gui_paint(&state, &backend);
+            if (em_record.glyphs < 20 || em_record.min_x < 0 ||
+                em_record.max_x > 480 || em_record.min_y < 0 ||
+                em_record.max_y > 320) {
+                printf("gui self-test: emoji panel drew %d glyphs, box %d..%d x %d..%d\n",
+                       em_record.glyphs, em_record.min_x, em_record.max_x,
+                       em_record.min_y, em_record.max_y);
+                return 2;
+            }
+            tg_gui_emoji_move(&state, 1, 0);
+            tg_gui_emoji_move(&state, 0, 1);
+            before = state.emoji_sel;
+            if (before <= 1 || !tg_gui_emoji_pick(&state) ||
+                strlen(state.input) != 2UL || state.emoji_recent_count != 1 ||
+                state.emoji_recent[0] != (unsigned short)before) {
+                puts("gui self-test: emoji pick / recents");
+                return 2;
+            }
+            /* the new recents row shifted the sheet by one cell: the
+               highlight must still sit on the glyph just picked, and a
+               second pick must repeat it */
+            if (state.emoji_sel != before + 1 || !tg_gui_emoji_pick(&state) ||
+                strlen(state.input) != 4UL || state.input[2] != state.input[0] ||
+                state.input[3] != state.input[1] ||
+                state.emoji_recent_count != 1) {
+                printf("gui self-test: emoji highlight after pick (sel %d, before %d)\n",
+                       state.emoji_sel, before);
+                return 2;
+            }
+            /* now a recents row exists: repaint and hit its first cell */
+            tg_gui_paint(&state, &backend);
+            hit = tg_gui_hit_test(&state, 480, 320, 10,
+                                  (tg_gui_sidebar_w(480)) + 8 + 2 + 3,
+                                  tg_gui_emoji_geom_y + 2 + 3);
+            if (hit != TG_GUI_HIT_EMOJI_BASE + 0) {
+                printf("gui self-test: emoji hit test gave %d\n", hit);
+                return 2;
+            }
+            tg_gui_emoji_close(&state);
+            /* the smiley button sits between the input and Send */
+            hit = tg_gui_hit_test(&state, 480, 320, 10, 480 - 64 - 4, 292);
+            if (hit != TG_GUI_HIT_EMOJI_BUTTON) {
+                printf("gui self-test: emoji button hit gave %d\n", hit);
+                return 2;
+            }
+            (void)remove("data/telegram-emoji-recent.txt");
+            state.input[0] = '\0';
+            state.input_caret = 0;
+            state.emoji_recent_count = 0;
+            backend.context = &record;
+        }
+
+        /* Turning emoji off while composing removes both UI entry points,
+           closes the picker and keeps the existing pair intact. */
+        {
+            tg_gui_record disabled;
+            char kept[8];
+            int enabled_width;
+            int h;
+
+            state.input[0] = '\0';
+            state.input_caret = 0;
+            if (!tg_gui_composer_insert_emoji(&state, 0UL)) {
+                puts("gui self-test: emoji toggle fixture");
+                return 2;
+            }
+            strcpy(kept, state.input);
+            tg_gui_emoji_open(&state);
+            enabled_width = tg_gui_input_text_w(&state, 480, tg_gui_sidebar_w(480));
+            tg_gui_set_emoji_enabled(&state, 0);
+            if (state.emoji_active || !state.emoji_explicit ||
+                !state.emoji_default_resolved || !state.inline_photos) {
+                puts("gui self-test: emoji toggle did not close picker independently");
+                return 2;
+            }
+            tg_gui_emoji_open(&state);
+            if (state.emoji_active || tg_gui_emoji_pick(&state) ||
+                tg_gui_composer_insert_emoji(&state, 1UL) ||
+                strcmp(kept, state.input) != 0 || state.input_caret != 2) {
+                puts("gui self-test: disabled emoji changed the composer");
+                return 2;
+            }
+            memset(&disabled, 0, sizeof(disabled));
+            disabled.width = 480;
+            disabled.height = 320;
+            backend.context = &disabled;
+            tg_gui_paint(&state, &backend);
+            if (disabled.glyphs != 0 ||
+                tg_gui_hit_test(&state, 480, 320, 10, 480 - 64 - 4, 292) !=
+                    TG_GUI_HIT_INPUT ||
+                tg_gui_input_text_w(&state, 480, tg_gui_sidebar_w(480)) <=
+                    enabled_width) {
+                puts("gui self-test: disabled emoji still paints or reserves its button");
+                return 2;
+            }
+            for (h = 8; h <= 24; ++h) {
+                if (tg_gui_emoji_inline_size(&state, h) != 0) {
+                    puts("gui self-test: disabled emoji still selects graphical text");
+                    return 2;
+                }
+            }
+            tg_gui_set_emoji_enabled(&state, 1);
+            for (h = 8; h <= 24; ++h) {
+                if (tg_gui_emoji_inline_size(&state, h) != (h < 16 ? 16 : h)) {
+                    puts("gui self-test: enabled emoji is unreadable on small font");
+                    return 2;
+                }
+            }
+            tg_gui_emoji_open(&state);
+            if (!state.emoji_active || strcmp(kept, state.input) != 0) {
+                puts("gui self-test: emoji cannot be enabled again");
+                return 2;
+            }
+            tg_gui_emoji_close(&state);
+            state.input[0] = '\0';
+            state.input_caret = 0;
+            backend.context = &record;
+        }
+
         /* 0.0.92: with inline photos off, a sticker's marker says what the
            sticker is instead of "[Photo]", and it keeps the click target that
            opens the viewer. A photo's marker is unchanged. */
@@ -4279,6 +5615,367 @@ int tg_gui_self_test(void)
             backend.context = &record;
             if (st_record.forbidden_hits != 0 || state.photo_w[1] <= 0) {
                 puts("gui self-test: sticker marker fell back to [Photo]");
+                return 2;
+            }
+        }
+    }
+
+    /* A small native font stays at its original size, centred in a readable
+       emoji cell. Row spacing must contain it; OFF restores compact metrics. */
+    {
+        static const int metrics[][5] = {
+            /* font height/baseline, line height, cell ascent, emoji square */
+            {8, 6, 18, 10, 16},
+            {9, 6, 18, 9, 16},
+            {12, 9, 18, 11, 16},
+            {16, 11, 18, 11, 16},
+            {24, 18, 26, 18, 24}
+        };
+        static tg_gui_state draft;
+        unsigned long i;
+        int enabled;
+
+        tg_gui_demo_state(&draft);
+        for (i = 0; i < sizeof(metrics) / sizeof(metrics[0]); ++i) {
+            const int *m = metrics[i];
+
+            draft.emoji_enabled = 1;
+            if (tg_gui_font_line_height(&draft, m[0]) != m[2] ||
+                tg_gui_font_cell_ascent(&draft, m[0], m[1]) != m[3] ||
+                tg_gui_emoji_inline_size(&draft, m[0]) != m[4]) {
+                puts("gui self-test: emoji line metrics do not fit the glyph");
+                return 2;
+            }
+            draft.emoji_enabled = 0;
+            if (tg_gui_font_line_height(&draft, m[0]) != m[0] + 2 ||
+                tg_gui_font_cell_ascent(&draft, m[0], m[1]) != m[1]) {
+                puts("gui self-test: disabled emoji did not restore font metrics");
+                return 2;
+            }
+        }
+        for (enabled = 0; enabled <= 1; ++enabled) {
+            tg_gui_record rec;
+            tg_gui_backend b = backend;
+            int sw = tg_gui_sidebar_w(1280);
+            int y;
+
+            memset(&rec, 0, sizeof(rec));
+            rec.width = 1280;
+            rec.height = 720;
+            draft.emoji_enabled = enabled;
+            rec.line_h = tg_gui_font_line_height(&draft, 8);
+            rec.ascent = tg_gui_font_cell_ascent(&draft, 8, 6);
+            b.context = &rec;
+            b.font_ascent = tg_gui_rec_ascent;
+            strcpy(draft.input, "abc");
+            draft.input_caret = 2;
+            draft.composing = 1;
+            tg_gui_paint_input_row(&draft, &b);
+            y = rec.first_text_y;
+            if (rec.first_text_x != sw + 34 ||
+                tg_gui_input_click_caret(&draft, &b, rec.first_text_x + 6, y) != 1 ||
+                tg_gui_hit_test(&draft, 1280, 720, rec.line_h,
+                                 sw + 18, y) != TG_GUI_HIT_ATTACH_BUTTON ||
+                tg_gui_hit_test(&draft, 1280, 720, rec.line_h,
+                                 rec.first_text_x, y) != TG_GUI_HIT_INPUT) {
+                puts("gui self-test: paperclip overlaps input or shifts caret clicks");
+                return 2;
+            }
+            if (enabled) {
+                char pair[2];
+                int glyph_bottom;
+
+                /* Clicking the last pixel of the first line's tall emoji
+                   must stay on that line, not select the next wrapped row. */
+                memset(&draft.messages[0], 0, sizeof(draft.messages[0]));
+                draft.messages[0].is_own = 1;
+                (void)tg_gui_emoji_encode(0UL, pair);
+                strcpy(draft.messages[0].text, "aXXb\nabc");
+                draft.messages[0].text[1] = pair[0];
+                draft.messages[0].text[2] = pair[1];
+                draft.message_count = draft.msg_cached = 1;
+                draft.msg_top[0] = 10;
+                draft.tr_area_x = 10;
+                draft.tr_area_w = 480;
+                rec.texts = 0;
+                (void)tg_gui_paint_bubble(&b, &draft.messages[0], 10, 480,
+                                          10, rec.line_h, 0, 200, 0, 0, 1, 0, 0);
+                glyph_bottom = rec.first_text_y - rec.ascent + 15;
+                if (tg_gui_transcript_char_at(&draft, &b, rec.line_h, 0,
+                                               rec.first_text_x + 6,
+                                               glyph_bottom) != 1) {
+                    puts("gui self-test: tall emoji click leaked into next chat row");
+                    return 2;
+                }
+                memcpy(draft.messages[0].reply_text, pair, 2);
+                draft.messages[0].reply_text[2] = '\0';
+                rec.texts = 0;
+                (void)tg_gui_paint_bubble(&b, &draft.messages[0], 10, 480,
+                                          10, rec.line_h, 0, 200, 0, 0, 1, 0, 0);
+                if (rec.first_text_y - rec.ascent < 10 ||
+                    rec.first_text_y - rec.ascent + 16 > 10 + rec.line_h) {
+                    puts("gui self-test: tall reply emoji overlaps the message body");
+                    return 2;
+                }
+            }
+        }
+        if (!tg_gui_attachment_is_photo("Work:photo.PNG") ||
+            !tg_gui_attachment_is_photo("Work:photo.JpEg") ||
+            !tg_gui_attachment_is_photo("Work:photo.jpg") ||
+            tg_gui_attachment_is_photo("Work:photo.jpeg.backup") ||
+            tg_gui_attachment_is_photo("Work:images.png/readme") ||
+            tg_gui_attachment_is_photo("Work:archive.lha") ||
+            tg_gui_attachment_is_photo(0)) {
+            puts("gui self-test: attachment photo/file choice mismatch");
+            return 2;
+        }
+    }
+
+    /* A buffered backend must know every opaque popup area, including its
+       outline, to put it back above photos without calling a text renderer
+       under a native layer lock. Full and caret paints must agree, and a
+       closed popup must not leave a stale region in the next frame. */
+    {
+        static tg_gui_state draft;
+        int mask;
+        int caret;
+
+        for (mask = 0; mask < 8; ++mask) {
+            tg_gui_rect full[3];
+            int expected = ((mask & 1) != 0) + ((mask & 2) != 0) +
+                           ((mask & 4) != 0);
+
+            tg_gui_demo_state(&draft);
+            draft.messages[1].id = 2UL;
+            draft.composing = 1;
+            draft.ctx_visible = (mask & 1) != 0;
+            draft.ctx_msg = 1;
+            draft.ctx_x = 320;
+            draft.ctx_y = 200;
+            draft.mention_active = (mask & 2) != 0;
+            draft.mention_count = 1;
+            strcpy(draft.mention_items[0], "sample");
+            draft.emoji_enabled = 1;
+            draft.emoji_active = (mask & 4) != 0;
+            for (caret = 0; caret < 2; ++caret) {
+                tg_gui_record rec;
+                tg_gui_backend b = backend;
+                int p;
+
+                memset(&rec, 0, sizeof(rec));
+                rec.width = 640;
+                rec.height = 480;
+                b.context = &rec;
+                b.popup_area = tg_gui_rec_popup;
+                if (caret) {
+                    tg_gui_paint_caret(&draft, &b);
+                } else {
+                    tg_gui_paint(&draft, &b);
+                }
+                if (rec.popup_count != expected ||
+                    rec.popup_frames != expected) {
+                    puts("gui self-test: popup replay bounds miss an opaque frame");
+                    return 2;
+                }
+                for (p = 0; p < expected; ++p) {
+                    tg_gui_rect r = rec.popup_rects[p];
+
+                    if (r.w <= 2 || r.h <= 2 || r.x < -1 || r.y < -1 ||
+                        r.x + r.w > rec.width || r.y + r.h > rec.height) {
+                        puts("gui self-test: popup replay bounds leave the window");
+                        return 2;
+                    }
+                    if (!caret) {
+                        full[p] = r;
+                    } else if (r.x != full[p].x || r.y != full[p].y ||
+                               r.w != full[p].w || r.h != full[p].h) {
+                        puts("gui self-test: caret changes popup replay bounds");
+                        return 2;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Emoji spacing must not resize avatars, rows or the open-chat header.
+       Record the actual painter at OS3 resolution, including odd native fonts,
+       initials/photos, single/two-line rows and both subtitle/typing paths. */
+    {
+        static const int fonts[][11] = {
+            /* native height/baseline, avatar diameters, search/row/header heights,
+               then search/name/single-line/title baselines */
+            {8, 6, 20, 18, 20, 32, 44, 12, 30, 70, 16},
+            {9, 6, 22, 20, 21, 34, 47, 12, 31, 73, 16},
+            {12, 9, 28, 26, 24, 40, 56, 15, 37, 87, 21},
+            {16, 11, 36, 34, 28, 48, 68, 17, 43, 103, 25},
+            {24, 18, 52, 50, 36, 64, 92, 24, 58, 138, 36}
+        };
+        static tg_gui_state draft;
+        unsigned long f;
+        int enabled;
+        int images;
+
+        for (f = 0; f < sizeof(fonts) / sizeof(fonts[0]); ++f) {
+            for (enabled = 0; enabled <= 1; ++enabled) {
+                for (images = 0; images <= 1; ++images) {
+                    tg_gui_record rec;
+                    tg_gui_backend b = backend;
+                    int w;
+
+                    tg_gui_demo_state(&draft);
+                    tg_gui_set_emoji_enabled(&draft, enabled);
+                    strcpy(draft.chats[0].name, "Row name \x80!");
+                    strcpy(draft.chats[0].preview, "Preview \x80!");
+                    strcpy(draft.chats[1].name, "Single \x80!");
+                    draft.chats[1].preview[0] = '\0';
+                    strcpy(draft.title, "Header title \x80!");
+                    strcpy(draft.subtitle, "Header subtitle \x80!");
+                    if (images) {
+                        strcpy(draft.typing, "Header typing \x80!");
+                    }
+                    draft.more_above = 1; /* ensure a transcript scrollbar */
+                    memset(&rec, 0, sizeof(rec));
+                    rec.width = 1280;
+                    rec.height = 720;
+                    rec.font_h = fonts[f][0];
+                    rec.line_h = tg_gui_font_line_height(&draft, rec.font_h);
+                    rec.ascent = tg_gui_font_cell_ascent(
+                        &draft, rec.font_h, fonts[f][1]);
+                    rec.watch_text[0] = draft.chats[0].name;
+                    rec.watch_text[1] = draft.chats[0].preview;
+                    rec.watch_text[2] = draft.chats[1].name;
+                    rec.watch_text[3] = draft.title;
+                    rec.watch_text[4] = images ? draft.typing : draft.subtitle;
+                    b.context = &rec;
+                    b.font_height = tg_gui_rec_font_height;
+                    b.font_ascent = tg_gui_rec_ascent;
+                    b.avatar_image = images ? tg_gui_rec_avatar_image : 0;
+                    tg_gui_paint(&draft, &b);
+                    if (rec.avatars != draft.chat_count + 1 ||
+                        rec.avatar_images != (images ? rec.avatars : 0)) {
+                        puts("gui self-test: avatar paths were not painted");
+                        return 2;
+                    }
+                    if (rec.first_avatar.w != fonts[f][2] ||
+                        rec.first_avatar.h != fonts[f][2] ||
+                        rec.first_avatar.x != 8) {
+                        puts("gui self-test: emoji setting resized sidebar avatars");
+                        return 2;
+                    }
+                    if (rec.last_avatar.w != fonts[f][3] ||
+                        rec.last_avatar.h != fonts[f][3] ||
+                        rec.last_avatar.x != tg_gui_sidebar_w(1280) + 12) {
+                        puts("gui self-test: emoji setting resized the header avatar");
+                        return 2;
+                    }
+                    if (2 * rec.first_avatar.y + rec.first_avatar.h !=
+                        2 * fonts[f][4] + fonts[f][5]) {
+                        puts("gui self-test: sidebar avatar left the row centre");
+                        return 2;
+                    }
+                    if (rec.last_avatar.y != (fonts[f][6] - fonts[f][3]) / 2) {
+                        puts("gui self-test: header avatar left the header centre");
+                        return 2;
+                    }
+                    if (rec.second_avatar.y - rec.first_avatar.y != fonts[f][5]) {
+                        puts("gui self-test: emoji setting expanded chat rows");
+                        return 2;
+                    }
+                    if (draft.sb_tr_max <= 0 || draft.sb_tr_ty != fonts[f][6]) {
+                        puts("gui self-test: emoji setting expanded the chat header");
+                        return 2;
+                    }
+                    for (w = 0; w < 5; ++w) {
+                        if (rec.watch_hits[w] != 1) {
+                            puts("gui self-test: navigation labels were not painted");
+                            return 2;
+                        }
+                    }
+                    if (enabled) {
+                        int cell = tg_gui_emoji_inline_size(&draft, rec.font_h);
+                        int name_top = rec.watch_y[0] - rec.ascent;
+                        int preview_top = rec.watch_y[1] - rec.ascent;
+                        int title_top = rec.watch_y[3] - rec.ascent;
+                        int subtitle_top = rec.watch_y[4] - rec.ascent;
+
+                        /* The native draw_text places each encoded emoji at
+                           baseline - cell ascent. Both 16px pictures must fit
+                           inside the real row/header and clear each other. */
+                        if (name_top < fonts[f][4] ||
+                            name_top + cell > preview_top ||
+                            preview_top + cell > fonts[f][4] + fonts[f][5] ||
+                            title_top < 0 || title_top + cell > subtitle_top ||
+                            subtitle_top + cell > draft.sb_tr_ty) {
+                            puts("gui self-test: navigation emoji escaped compact rows");
+                            return 2;
+                        }
+                    }
+                    if (rec.first_text_y != fonts[f][7] ||
+                        rec.watch_y[0] != fonts[f][8] ||
+                        rec.watch_y[1] != fonts[f][8] + fonts[f][5] / 2 ||
+                        rec.watch_y[2] != fonts[f][9] ||
+                        rec.watch_y[3] != fonts[f][10] ||
+                        rec.watch_y[4] != fonts[f][10] + fonts[f][5] / 2) {
+                        puts("gui self-test: navigation text moved with emoji spacing");
+                        return 2;
+                    }
+                    if (tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4] - 1) != TG_GUI_HIT_SEARCH ||
+                        tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4]) != 0 ||
+                        tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4] + fonts[f][5] - 1) != 0 ||
+                        tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12,
+                                        fonts[f][4] + fonts[f][5]) != 1) {
+                        puts("gui self-test: chat clicks missed compact rows");
+                        return 2;
+                    }
+                    if (tg_gui_search_click_caret(&draft, &b, 12,
+                                                  fonts[f][4] - 1) != 0 ||
+                        tg_gui_search_click_caret(&draft, &b, 12,
+                                                  fonts[f][4]) != -1) {
+                        puts("gui self-test: search click entered a chat row");
+                        return 2;
+                    }
+                    if (tg_gui_chat_drop_target(&draft, rec.line_h,
+                            fonts[f][4] + fonts[f][5] / 2 - 1) != 0 ||
+                        tg_gui_chat_drop_target(&draft, rec.line_h,
+                            fonts[f][4] + fonts[f][5] / 2) != 1) {
+                        puts("gui self-test: chat reorder missed compact row gaps");
+                        return 2;
+                    }
+                }
+            }
+        }
+        /* A scrolled list must use the same row pitch for its knob, hits and
+           drops. Toggle the same state, as the live Settings menu does. */
+        tg_gui_demo_state(&draft);
+        for (enabled = draft.chat_count; enabled < TG_GUI_MAX_CHATS; ++enabled) {
+            draft.chats[enabled] = draft.chats[4];
+        }
+        draft.chat_count = TG_GUI_MAX_CHATS;
+        draft.chat_scroll = 3;
+        for (enabled = 0; enabled <= 1; ++enabled) {
+            tg_gui_record rec;
+            tg_gui_backend b = backend;
+
+            memset(&rec, 0, sizeof(rec));
+            tg_gui_set_emoji_enabled(&draft, enabled);
+            rec.width = 1280;
+            rec.height = 720;
+            rec.font_h = 8;
+            rec.line_h = tg_gui_font_line_height(&draft, 8);
+            rec.ascent = tg_gui_font_cell_ascent(&draft, 8, 6);
+            b.context = &rec;
+            b.font_height = tg_gui_rec_font_height;
+            b.font_ascent = tg_gui_rec_ascent;
+            tg_gui_paint(&draft, &b);
+            if (draft.sb_list_ty != 20 ||
+                draft.sb_list_max != TG_GUI_MAX_CHATS - 21 ||
+                rec.avatars != 22 || draft.chat_scroll != 3 ||
+                tg_gui_hit_test(&draft, 1280, 720, rec.line_h, 12, 52) != 4 ||
+                tg_gui_chat_drop_target(&draft, rec.line_h, 84) != 5) {
+                puts("gui self-test: scrolled list lost compact navigation geometry");
                 return 2;
             }
         }
@@ -4357,17 +6054,17 @@ int tg_gui_self_test(void)
     }
 
     /* Hardware default matrix. Explicit OFF and ON win everywhere; without a
-       choice, only classic OS3 needs both a 040-class CPU and RTG. */
+       choice, classic Amiga hardware needs both a 040-class CPU and RTG. */
     {
         int explicit_choice;
         int value;
-        int classic_os3;
+        int classic_amiga;
         int cpu_040;
         int has_rtg;
 
         for (explicit_choice = 0; explicit_choice <= 1; ++explicit_choice) {
             for (value = 0; value <= 1; ++value) {
-                for (classic_os3 = 0; classic_os3 <= 1; ++classic_os3) {
+                for (classic_amiga = 0; classic_amiga <= 1; ++classic_amiga) {
                     for (cpu_040 = 0; cpu_040 <= 1; ++cpu_040) {
                         for (has_rtg = 0; has_rtg <= 1; ++has_rtg) {
                             int expected;
@@ -4375,10 +6072,10 @@ int tg_gui_self_test(void)
 
                             expected = explicit_choice
                                            ? value
-                                           : !(classic_os3 &&
+                                           : !(classic_amiga &&
                                                (!cpu_040 || !has_rtg));
-                            actual = tg_gui_inline_photos_resolve(
-                                explicit_choice, value, classic_os3, cpu_040,
+                            actual = tg_gui_graphics_resolve(
+                                explicit_choice, value, classic_amiga, cpu_040,
                                 has_rtg);
                             if (actual != expected) {
                                 puts("gui self-test: inline default matrix mismatch");
@@ -4388,6 +6085,89 @@ int tg_gui_self_test(void)
                     }
                 }
             }
+        }
+    }
+
+    /* Both features use the actual screen/CPU default, independently of each
+       other's saved choice. OCS/ECS/AGA all report a non-RTG screen here. */
+    {
+        static const int cases[][9] = {
+            /* Classic, 040+/PPC, RTG, photo/emoji explicit+value, results */
+            {1, 0, 0, 0, 1, 0, 1, 0, 0},
+            {1, 1, 0, 0, 1, 0, 1, 0, 0},
+            {1, 0, 1, 0, 1, 0, 1, 0, 0},
+            {1, 1, 1, 0, 0, 0, 0, 1, 1},
+            {0, 0, 0, 0, 0, 0, 0, 1, 1},
+            {1, 0, 0, 1, 1, 0, 1, 1, 0},
+            {1, 0, 0, 0, 1, 1, 1, 0, 1},
+            {1, 1, 1, 1, 0, 0, 0, 0, 1},
+            {1, 1, 1, 0, 0, 1, 0, 1, 0},
+            {0, 1, 1, 1, 0, 1, 0, 0, 0}
+        };
+        static tg_gui_state prefs;
+        unsigned long i;
+
+        for (i = 0UL; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            const int *c = cases[i];
+
+            memset(&prefs, 0, sizeof(prefs));
+            prefs.inline_photos_explicit = c[3];
+            prefs.inline_photos = c[4];
+            prefs.emoji_explicit = c[5];
+            prefs.emoji_enabled = c[6];
+            tg_gui_graphics_preferences_resolve(&prefs, c[0], c[1], c[2]);
+            if (prefs.inline_photos != c[7] || prefs.emoji_enabled != c[8] ||
+                prefs.inline_photos_explicit != c[3] || prefs.emoji_explicit != c[5] ||
+                !prefs.inline_photos_default_resolved || !prefs.emoji_default_resolved) {
+                printf("gui self-test: photo/emoji hardware case %lu failed\n", i);
+                return 2;
+            }
+            tg_gui_graphics_preferences_resolve(&prefs, 0, 1, 1);
+            if (prefs.inline_photos != c[7] || prefs.emoji_enabled != c[8]) {
+                puts("gui self-test: graphics choice changed during window reopen");
+                return 2;
+            }
+        }
+    }
+
+    /* Missing settings stay automatic; explicit emoji OFF/ON survives a new
+       run. A failed save must report failure instead of claiming persistence. */
+    {
+        const char *path = "tg-gui-emoji-self-test.tmp";
+        int enabled;
+        int explicit_choice;
+        int choice;
+
+        (void)remove(path);
+        tg_gui_emoji_preferences_load(path, &enabled, &explicit_choice);
+        if (!enabled || explicit_choice) {
+            puts("gui self-test: missing emoji preference is not automatic");
+            return 2;
+        }
+        for (choice = 0; choice <= 1; ++choice) {
+            if (tg_gui_emoji_preferences_save(path, choice) != 0) {
+                (void)remove(path);
+                puts("gui self-test: emoji preference save failed");
+                return 2;
+            }
+            tg_gui_emoji_preferences_load(path, &enabled, &explicit_choice);
+            if (enabled != choice || !explicit_choice) {
+                (void)remove(path);
+                puts("gui self-test: emoji preference round-trip failed");
+                return 2;
+            }
+        }
+        if (tg_gui_emoji_preferences_save(0, 0) == 0 ||
+            tg_gui_emoji_preferences_save("tg-gui-emoji-self-test.tmp/child", 0) == 0) {
+            (void)remove(path);
+            puts("gui self-test: emoji preference hid save failure");
+            return 2;
+        }
+        tg_gui_emoji_preferences_load(path, &enabled, &explicit_choice);
+        (void)remove(path);
+        if (!enabled || !explicit_choice) {
+            puts("gui self-test: failed emoji save changed prior choice");
+            return 2;
         }
     }
 

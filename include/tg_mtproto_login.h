@@ -42,6 +42,8 @@ typedef struct tg_mtproto_sent_code {
     unsigned long timeout;
     int has_timeout;
     int has_type_length;
+    unsigned long next_type; /* auth.CodeType of the next route, 0 if none */
+    int has_next_type;
     char phone_code_hash[128];
 } tg_mtproto_sent_code;
 
@@ -178,6 +180,20 @@ typedef struct tg_mtproto_photo_meta {
        a JPEG like any other. */
     int from_document;
 } tg_mtproto_photo_meta;
+
+/* The bounded part of a WebPage that both clients can display. The parser
+   stops after its photo; embed/document/instant-view tails are not consumed. */
+#define TG_MTPROTO_WEBPAGE_TEXT_MAX 280U
+typedef struct tg_mtproto_web_page {
+    unsigned long id_hi;
+    unsigned long id_lo;
+    int pending;
+    char text[TG_MTPROTO_WEBPAGE_TEXT_MAX];
+    tg_mtproto_photo_meta photo;
+} tg_mtproto_web_page;
+
+tg_mtproto_tl_status tg_mtproto_read_web_page(tg_mtproto_tl_reader *reader,
+                                             tg_mtproto_web_page *out);
 
 /* Parses one bare Document (document#8fd4c4d8 / documentEmpty#36f8c871),
    reader positioned ON the constructor; leaves the reader right after the
@@ -454,6 +470,8 @@ typedef struct tg_mtproto_message_text {
        synthetic "[Photo]" fallback from a real caption. */
     tg_mtproto_photo_meta photo;
     int photo_only;
+    unsigned long pending_webpage_hi;
+    unsigned long pending_webpage_lo;
 } tg_mtproto_message_text;
 
 typedef struct tg_mtproto_message_text_list {
@@ -473,6 +491,7 @@ typedef struct tg_mtproto_updates_summary {
     unsigned long id;
     unsigned long date;
     int has_sent_message;
+    tg_mtproto_web_page webpage;
 } tg_mtproto_updates_summary;
 
 tg_mtproto_tl_status tg_mtproto_build_invoke_with_layer(
@@ -507,6 +526,13 @@ tg_mtproto_tl_status tg_mtproto_build_auth_sign_in(
     const char *phone_number,
     const char *phone_code_hash,
     const char *phone_code);
+
+/* auth.resendCode: ask Telegram to send the pending code by the route it
+   named as next_type in the previous auth.sentCode (usually SMS). */
+tg_mtproto_tl_status tg_mtproto_build_auth_resend_code(
+    tg_mtproto_tl_writer *writer,
+    const char *phone_number,
+    const char *phone_code_hash);
 
 tg_mtproto_tl_status tg_mtproto_build_auth_sign_up(
     tg_mtproto_tl_writer *writer,

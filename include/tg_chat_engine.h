@@ -91,6 +91,10 @@ typedef struct tg_chat_message_row {
     unsigned long photo_id_lo;
     unsigned long photo_width;
     unsigned long photo_height;
+    unsigned long pending_webpage_hi;
+    unsigned long pending_webpage_lo;
+    unsigned long webpage_channel_hi;
+    unsigned long webpage_channel_lo;
 } tg_chat_message_row;
 
 /* One resolved chat-list row. The engine parses the peer cache into these

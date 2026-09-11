@@ -12,10 +12,21 @@ Usage:
   morphos-vm-cmd.py --noshot "command"    # skip the screendump
 Screendump (when taken) -> /tmp/vm.png ; a cropped shell strip -> /tmp/vm_c.png
 """
-import socket, subprocess, sys, time
+import os, socket, subprocess, sys, time
 
-MON = ("/Volumes/EXT/Macchine Virtuali/Amiga/emu/telegram-amiga/"
-       "morphos/qemu-monitor.sock")
+MON = os.environ.get("MORPHOS_MON", "/tmp/morphos-monitor.sock")
+
+
+def _connect(s, path, tries=12):
+    """QEMU's monitor chardev serves ONE client at a time: a connect that lands
+    while the previous helper's socket is still being torn down is REFUSED.
+    Retry briefly instead of failing the whole step."""
+    for i in range(tries):
+        try:
+            s.connect(path); return
+        except ConnectionRefusedError:
+            if i == tries - 1: raise
+            time.sleep(0.5)
 
 # char -> QEMU sendkey qcode (US keyboard)
 M = {}
@@ -39,7 +50,7 @@ M.update({
 
 def mon_send(lines, settle=0.4):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(15); s.connect(MON); time.sleep(0.2)
+    s.settimeout(15); _connect(s, MON); time.sleep(0.2)
     try: s.recv(65536)
     except Exception: pass
     for ln in lines:

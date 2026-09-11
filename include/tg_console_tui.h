@@ -93,6 +93,18 @@ void tg_console_tui_leave(FILE *stream);
 FILE *tg_console_tui_capture_begin(FILE *fallback);
 void tg_console_tui_capture_end(FILE *capture, FILE *fallback);
 
+/* Associate the just-rendered message with its pending preview. The mark is
+   out of band: no protocol bytes are written into the visible transcript. */
+void tg_console_tui_capture_webpage(FILE *capture,
+                                    unsigned long page_hi, unsigned long page_lo,
+                                    unsigned long channel_hi, unsigned long channel_lo);
+/* Add completed preview lines next to every matching cached message. The
+   text is already in the console display encoding. Unknown ids do nothing. */
+int tg_console_tui_complete_webpage(FILE *stream,
+                                   unsigned long page_hi, unsigned long page_lo,
+                                   unsigned long channel_hi, unsigned long channel_lo,
+                                   const char *text);
+
 /* Remembers the prompt text the input row should show; the line editor
    redraws the row with it after every keystroke while the TUI is active. */
 void tg_console_tui_set_prompt(const char *prompt);

@@ -14,12 +14,23 @@ Usage:
   morphos-vm-click.py X Y --double
   morphos-vm-click.py X Y --crop x0 y0 x1 y1   # crop region for /tmp/vm_c.png
 """
-import subprocess, socket, sys, time
+import os, subprocess, socket, sys, time
 
 VNCDO = "/Users/kaffeine/amiga-dev/.venv-vnc/bin/vncdo"
 VNC = "127.0.0.1::5907"
-MON = ("/Volumes/EXT/Macchine Virtuali/Amiga/emu/telegram-amiga/"
-       "morphos/qemu-monitor.sock")
+MON = os.environ.get("MORPHOS_MON", "/tmp/morphos-monitor.sock")
+
+
+def _connect(s, path, tries=12):
+    """QEMU's monitor chardev serves ONE client at a time: a connect that lands
+    while the previous helper's socket is still being torn down is REFUSED.
+    Retry briefly instead of failing the whole step."""
+    for i in range(tries):
+        try:
+            s.connect(path); return
+        except ConnectionRefusedError:
+            if i == tries - 1: raise
+            time.sleep(0.5)
 
 
 def req(sx, sy):
@@ -28,7 +39,7 @@ def req(sx, sy):
 
 def mon(cmd):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(10); s.connect(MON); time.sleep(0.2)
+    s.settimeout(10); _connect(s, MON); time.sleep(0.2)
     try: s.recv(65536)
     except Exception: pass
     s.sendall((cmd + "\n").encode()); time.sleep(0.5)

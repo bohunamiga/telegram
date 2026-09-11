@@ -183,11 +183,11 @@ Plan, in order:
 2. DONE, and it cost nothing. A webPage photo is a plain Photo, so
    reading it hands the existing bounded pipeline exactly what it already
    knows, under the same Inline photos setting.
-3. Left for 0.0.93: `updateWebPage`, so a preview the server generates
-   late reaches an open chat. It only affects a link you send yourself
-   while the server is still fetching the page, it touches the update
-   path, and 0.0.92 is at full scope. Today a pending preview simply
-   stays silent until the history is read again.
+3. DONE for 0.0.93: `updateWebPage` and `updateChannelWebPage` complete a
+   pending preview in the open chat, matched by its 64-bit webpage id.
+   Both received messages and our own send echoes gain the title,
+   description and optional photo; the TUI updates its cached transcript.
+   Real-system validation remains part of the 0.0.93 release gate.
 
 Even complete, previews will stay per-link: the server builds them from
 the target page's metadata, so pages without usable metadata show none
@@ -306,11 +306,8 @@ is the worst moment to add a path that installs code.
 
 ## Planned: send other image formats, PNG first
 
-Only a JPEG can be sent as a photo today. The GUI decides from the file
-extension, and the upload path then checks the magic bytes and the SOF
-segment, refusing anything else with "not a valid JPEG"; every other
-image still goes out as a document, which works but arrives as a file
-rather than a picture.
+JPEG and PNG can be sent as photos in the 0.0.93 candidate. Other image
+formats still go out as documents; IFF conversion remains planned below.
 
 The upload itself is format agnostic, it is bytes plus
 `inputMediaUploadedPhoto`, so the work splits in two very different
@@ -325,6 +322,11 @@ Telegram's own limits from the header (width plus height at most 10000,
 at most 20 to 1, verified at core.telegram.org), and turns the server's
 refusals (`PHOTO_INVALID_DIMENSIONS`, `PHOTO_EXT_INVALID`,
 `IMAGE_PROCESS_FAILED`) into sentences.
+
+The photo size limit stays at 10 MiB; larger originals go as documents.
+"Save photo as..." follows the received JPEG/PNG signature and copies the
+bytes unchanged. A photo re-encoded by Telegram cannot supply the original
+PNG; sending it as File and using Download preserves that original instead.
 
 IFF ILBM is the interesting half, and the one that matters on this
 platform: it is what an Amiga actually produces, and Telegram will
@@ -609,24 +611,39 @@ hand to text emoticons, so a grinning face reads as `:D` and a heart as
 instead of a question mark, which would read as lost text. Two separate
 jobs remain, and the less obvious one matters more.
 
-Sending them is impossible today. An Amiga keyboard produces Latin-1,
-so there is no way to type a codepoint the composer can send, and a
-user who receives `:D` cannot answer in kind. That is the gap to close
-first, with a picker in the spirit of the desktop client: a panel above
-the composer, categories along one edge, a grid to walk with the arrow
-keys, ENTER to insert, ESC to leave, and a row of recently used ones
-that survives between runs like the other preferences. The rest of the
-road already exists, since the send path has converted the composer to
-UTF-8 from the start.
+Sending them is DONE in 0.0.93. The composer stays a Latin-1 buffer;
+an emoji in it is a two byte escape (a C1 prefix no keymap emits plus
+an index byte, with '@' left out so the mention popup never wakes),
+which the backends measure and draw as one square cell of the font
+height, the wrap never splits, the caret steps over whole, and the send
+path expands to the codepoint's UTF-8. The picker is the panel the plan
+described minus the category edge, which 109 glyphs do not need: the
+recent row first, then the sheet, arrows and ENTER, ESC, a click, and
+recents saved in data/telegram-emoji-recent.txt. The glyphs are Noto
+Emoji reduced to 16 pixels, on one shared palette, OFL 1.1, generated
+by scripts/gen-emoji-sheet.py from the emoticon table so the two stay
+in step; the three table entries with no Noto image (two arrows and a
+check mark) remain text only.
 
-The picker also settles the order of the drawing work, because a grid
-is the easy half. Painting a glyph into a cell of a panel needs no text
-layout at all, so a small built-in glyph sheet pays off immediately
-there, and the curated list already says which emoji are worth having.
-Only afterwards comes the hard half, showing them inside the
-transcript, where the renderer has to break a line into runs to place
-an image between them. That is the code that has hurt us before under
-AfA_OS, so it gets its own hardware pass before anyone calls it done.
+The hard half followed at once, because the machinery made it cheap:
+received emoji are pairs too, emitted by the display conversion for any
+codepoint the sheet knows, and the backends draw them inside the text
+runs. With emoji enabled the cell is now at least sixteen pixels, even on
+OS3 with Topaz 8: the font stays unchanged, and the line metrics reserve room
+for the glyph and centre the smaller letters beside it. Resolution does not
+decide whether an emoji becomes a picture. Avatars keep their native-font
+dimensions when this spacing changes, in both the chat list and the header.
+"Settings > Enable emoji"
+turns off the picker, its composer button and graphical text rendering,
+leaving text emoticons and any already-entered emoji intact. Its saved choice
+is independent of photos. Both features default off on native AGA/ECS/OCS
+screens (including classic OS4) or 68k CPUs below 68040, with explicit choices taking
+precedence. The screen's bitmap determines RTG, not an installed library.
+A monochrome paperclip at the composer's left opens an unfiltered attachment
+requester. JPEG/PNG names lead to the Photo/File/Cancel dialog; other files
+use the normal upload path. The paperclip stays usable with graphics off.
+Still owed: a hardware pass on every lane, the AfA_OS one in particular, before
+anyone calls the transcript rendering done.
 
 On borrowing: the desktop client is worth studying for how a feature
 should behave, and that is how it will be used here, as a reference for
@@ -636,6 +653,39 @@ is not something we can do. Where facts are needed rather than ideas,
 the safer wells are the published TL schema and TDLib, which carries a
 permissive licence, and for the emoji list and its categories the
 Unicode data files, which is where everyone else gets them anyway.
+
+## Planned: a preference for full-size photos in the viewer and on save
+
+A field question on 0.0.92: clicking a picture opens what looks like a
+reduced copy of a much larger image, and it is. Photos come in tiers
+picked by the parser: the inline copy targets 256 pixels on 68k and 800
+elsewhere, and the viewer, which "Save photo as..." also uses, takes the
+largest size under a byte cap, 768 KB on 68k and 2 MB on the other lanes,
+which usually lands at 640 and about 1024 pixels. Telegram normally keeps
+a 1280 pixel copy as well, and 2560 for some uploads, so the original is
+often bigger than anything the client fetches today.
+
+The request is fair and cheap to honour: a "Full size" preference for the
+viewer and for saving that takes the largest size the message offers,
+with no byte cap. The decoder already scales, so showing a 2560 pixel
+JPEG on a 68k is a download and a wait rather than a memory problem,
+which is exactly why it should be a choice and not the default. Saving
+would then write the original bytes Telegram holds, which is what a user
+who asks for the full image wants. A 0.0.94 item.
+
+## Planned: mentions in basic groups, and on MorphOS
+
+The '@' popup lists the members of the open group, and the member list
+comes from `channels.getParticipants`, which exists only for supergroups.
+A basic group (the kind a handful of friends make) has no channel id and
+would need `messages.getFullChat`, so in one of those the popup never
+appears, on any lane. On MorphOS the fetch is skipped outright, a guard
+from the bsdsocket freeze hunt, when a large participants reply was the
+documented trigger; the client has since moved photos and megabyte
+downloads through that stack without incident, so the guard deserves a
+measured retry on the machine rather than an assumption either way.
+Both were found again in the 0.0.93 field round, reported as "no popup
+after @", and the debug log now names which of the two it was.
 
 ## Planned: split long pastes into protocol-sized messages
 
@@ -753,6 +803,47 @@ can be requested, which also explains the silence that follows too many
 attempts. The manuals' first-start section gets the same sentence, so
 the answer arrives before the question.
 
+## Planned: sign in by QR code, so no code has to arrive at all
+
+Every login problem this project has had has the same shape: the client
+asks Telegram for a code, Telegram says it sent one, and the user never
+sees it. It has happened to two different people now, on two different
+systems, and neither case was a bug in the request. One was a service
+chat nobody thought to look in; the other was an account that Telegram
+wanted to set up a login email for before it would send anything. The
+client can say all of this now, and it does, but saying it is not the
+same as not needing it.
+
+Telegram has a login route that skips the code completely, and it is the
+one its own desktop client offers first. `auth.exportLoginToken` returns
+a token that lasts about thirty seconds; the client renders
+`tg://login?token=<base64url>` as a QR code; the user points an
+already-signed-in phone at the screen and confirms; `updateLoginToken`
+arrives, the client calls export again and gets `auth.loginTokenSuccess`,
+or `auth.loginTokenMigrateTo` and then `auth.importLoginToken` on the
+datacenter it names. Two-step verification still asks for its password
+afterwards, as it does today.
+
+For a retro machine the drawing is the easy half: a QR code is a grid of
+black and white squares, which is the cheapest thing this renderer can
+put on a screen, and it works on a plain AGA display as well as on RTG.
+The work is a QR encoder and the token exchange, and the reward is a
+first login that cannot fail because a message did not arrive. The
+existing code path stays: a phone that cannot scan, or a user who
+prefers typing, still gets the number and the code.
+
+## Planned: the api credentials the packages carry
+
+Every package ships the same api_id and api_hash in a plain text file, so
+that the client works the moment it is unpacked. That convenience has two
+costs. The credentials are published, which is the one thing Telegram's
+terms tell developers not to do with them, and everybody shares one set
+of limits. The default pair belongs in the binary instead, with
+`data/telegram-api.txt` kept as the override for anyone who wants their
+own; the file stops being part of what we distribute, and a new pair can
+be rolled out with a release. The pair itself should belong to the
+project rather than to a personal account.
+
 ## Open: one crash on AROS x86_64, in idle, not reproduced
 
 Seen once during the 0.0.92 field test, on 2026-09-02, in the AROS One
@@ -792,12 +883,11 @@ the serial channel stays silent, which is what we found.
 Both reported from the field on 0.0.9 and both about the right-click popup
 living next to inline photos.
 
-1. Opening the popup beside a photo draws it BEHIND the picture. The window
-   paint composes the popup last for exactly this reason, but the photo
-   replay is a separate pass that writes straight to the window RastPort
-   (the CyberGraphX path) after the blit, so it lands on top. The popup
-   needs to be excluded from the replay's dirty rectangles, or repainted
-   after them.
+1. DONE in 0.0.93, to be confirmed on the machine: the popup was drawn
+   BEHIND the picture because the photo replay writes straight to the
+   window RastPort after the blit. The popups (context menu, mention list,
+   emoji panel) are now painted once more right after the replay, onto the
+   window, through the same core painters.
 2. On an own screen, right-clicking in the conversation to pick an entry
    makes the chat flicker. The popup path repaints more than it needs to
    there; the transcript should keep its pixels while only the popup area

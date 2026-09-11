@@ -56,6 +56,24 @@ int tg_mtproto_auth_sign_in_file(const char *host,
                                  const char *phone_code,
                                  const char *dc_id_text,
                                  FILE *stream);
+/* auth.resendCode on the auth key that requested the code: Telegram sends it
+   again by the route it named as next_type (usually SMS). 0 = sent again. */
+int tg_mtproto_auth_resend_code(const char *host,
+                                const char *port,
+                                const char *api_id_text,
+                                const char *auth_file,
+                                const char *phone_number,
+                                const char *code_hash_file,
+                                const char *dc_id_text,
+                                FILE *stream);
+int tg_mtproto_auth_resend_code_file(const char *host,
+                                     const char *port,
+                                     const char *api_file,
+                                     const char *auth_file,
+                                     const char *phone_number,
+                                     const char *code_hash_file,
+                                     const char *dc_id_text,
+                                     FILE *stream);
 int tg_mtproto_auth_sign_up(const char *host,
                             const char *port,
                             const char *api_id_text,
@@ -222,6 +240,13 @@ int tg_mtproto_auth_forget(const char *auth_file,
                            const char *code_hash_file,
                            FILE *stream);
 int tg_mtproto_probe_self_test(void);
+#if !defined(TG_NO_SELFTEST) && !defined(TG_NO_GUI)
+struct tg_gui_chat_driver;
+/* Replay the production collector/application path against an offline ring. */
+int tg_mtproto_test_webpage_update(struct tg_gui_chat_driver *gui,
+                                   const unsigned char *body, unsigned long length,
+                                   unsigned long channel_hi, unsigned long channel_lo);
+#endif
 
 /* Golden parity check for the transcript renderer (the chat model/view seam):
    renders a fixed message script with colours off and asserts byte-equality

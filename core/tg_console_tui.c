@@ -507,6 +507,17 @@ void tg_console_tui_set_enabled(int enabled)
 
 static char tg_tui_backlog[TG_TUI_BACKLOG_LINES][TG_TUI_BACKLOG_WIDTH];
 static unsigned long tg_tui_backlog_total = 0UL;
+typedef struct tg_tui_webpage_mark {
+    long end_offset;
+    unsigned long page_hi;
+    unsigned long page_lo;
+    unsigned long channel_hi;
+    unsigned long channel_lo;
+} tg_tui_webpage_mark;
+static tg_tui_webpage_mark tg_tui_webpages[TG_TUI_BACKLOG_LINES];
+static tg_tui_webpage_mark tg_tui_capture_marks[TG_TUI_BACKLOG_LINES];
+static unsigned long tg_tui_capture_mark_count = 0UL;
+static FILE *tg_tui_mark_capture = 0;
 static char tg_tui_hidden_rows[TG_TUI_HIDDEN_ROWS][TG_TUI_SAVED_ROW_WIDTH];
 static unsigned int tg_tui_hidden_row_count = 0U;
 static char tg_tui_tail_rows[TG_TUI_HIDDEN_ROWS][TG_TUI_SAVED_ROW_WIDTH];
@@ -566,6 +577,8 @@ static void tg_tui_backlog_record(const char *text)
     char *slot = tg_tui_backlog[tg_tui_backlog_total % TG_TUI_BACKLOG_LINES];
     unsigned long n = 0UL;
 
+    memset(&tg_tui_webpages[tg_tui_backlog_total % TG_TUI_BACKLOG_LINES], 0,
+           sizeof(*tg_tui_webpages));
     if (text != 0) {
         while (text[n] != '\0' && n + 1UL < TG_TUI_BACKLOG_WIDTH) {
             slot[n] = text[n];
@@ -1067,6 +1080,7 @@ int tg_console_tui_enter(FILE *stream, const char *status_text)
     tg_tui_composer_cache_valid = 0;
     tg_tui_active = 1;
     tg_tui_resize_flag = 0;
+    memset(tg_tui_webpages, 0, sizeof(tg_tui_webpages));
     /* Subscribe to the console's NEWSIZE (12) and CLOSEWINDOW (11) raw
        events: resizes arrive on stdin as CSI 12;...| reports (turned into a
        pending-resize flag) and a close-gadget click as CSI 11;...| (turned
@@ -1547,7 +1561,98 @@ FILE *tg_console_tui_capture_begin(FILE *fallback)
         return fallback;
     }
     capture = tmpfile();
+    tg_tui_mark_capture = capture;
+    tg_tui_capture_mark_count = 0UL;
     return capture != 0 ? capture : fallback;
+}
+
+void tg_console_tui_capture_webpage(FILE *capture,
+                                    unsigned long page_hi, unsigned long page_lo,
+                                    unsigned long channel_hi, unsigned long channel_lo)
+{
+    tg_tui_webpage_mark *mark;
+    long offset;
+
+    if (!tg_tui_active || capture == 0 || capture != tg_tui_mark_capture ||
+        (page_hi == 0UL && page_lo == 0UL) ||
+        tg_tui_capture_mark_count == TG_TUI_BACKLOG_LINES) {
+        return;
+    }
+    offset = ftell(capture);
+    if (offset < 0L) return;
+    mark = &tg_tui_capture_marks[tg_tui_capture_mark_count++];
+    mark->end_offset = offset;
+    mark->page_hi = page_hi;
+    mark->page_lo = page_lo;
+    mark->channel_hi = channel_hi;
+    mark->channel_lo = channel_lo;
+}
+
+/* Insert a preview paragraph in the bounded backlog, preserving the metadata
+   on every shifted row. A full ring drops its oldest row as usual. */
+static void tg_tui_insert_preview(unsigned long at, const char *text,
+                                   unsigned long length)
+{
+    unsigned long k;
+    unsigned long slot;
+
+    for (k = tg_tui_backlog_total; k > at; --k) {
+        memcpy(tg_tui_backlog[k % TG_TUI_BACKLOG_LINES],
+               tg_tui_backlog[(k - 1UL) % TG_TUI_BACKLOG_LINES],
+               TG_TUI_BACKLOG_WIDTH);
+        tg_tui_webpages[k % TG_TUI_BACKLOG_LINES] =
+            tg_tui_webpages[(k - 1UL) % TG_TUI_BACKLOG_LINES];
+    }
+    slot = at % TG_TUI_BACKLOG_LINES;
+    if (length >= TG_TUI_BACKLOG_WIDTH) length = TG_TUI_BACKLOG_WIDTH - 1UL;
+    memcpy(tg_tui_backlog[slot], text, length);
+    tg_tui_backlog[slot][length] = '\0';
+    memset(&tg_tui_webpages[slot], 0, sizeof(*tg_tui_webpages));
+    ++tg_tui_backlog_total;
+}
+
+int tg_console_tui_complete_webpage(FILE *stream,
+                                   unsigned long page_hi, unsigned long page_lo,
+                                   unsigned long channel_hi, unsigned long channel_lo,
+                                   const char *text)
+{
+    unsigned long back;
+    unsigned long at;
+    unsigned long available;
+    int changed = 0;
+
+    if (!tg_tui_active || stream == 0 || text == 0 ||
+        (page_hi == 0UL && page_lo == 0UL)) return 0;
+    available = tg_tui_backlog_available();
+    at = tg_tui_backlog_total;
+    for (back = 0UL; back < available; ++back) {
+        tg_tui_webpage_mark *mark;
+        const char *p;
+        unsigned long insert;
+
+        --at;
+        if (tg_tui_backlog_total - at > TG_TUI_BACKLOG_LINES) break;
+        mark = &tg_tui_webpages[at % TG_TUI_BACKLOG_LINES];
+        if (mark->page_hi != page_hi || mark->page_lo != page_lo ||
+            mark->channel_hi != channel_hi || mark->channel_lo != channel_lo) continue;
+        memset(mark, 0, sizeof(*mark));
+        p = text;
+        insert = at + 1UL;
+        while (*p != '\0') {
+            const char *end = strchr(p, '\n');
+            unsigned long n = end != 0 ? (unsigned long)(end - p)
+                                       : (unsigned long)strlen(p);
+            tg_tui_insert_preview(insert++, p, n);
+            if (end == 0) break;
+            p = end + 1;
+        }
+        changed = 1;
+    }
+    if (changed) {
+        tg_tui_redraw_region(stream);
+        fflush(stream);
+    }
+    return changed;
 }
 
 /* Staging buffers that feed the transcript used to DROP everything past
@@ -1621,7 +1726,18 @@ void tg_console_tui_capture_end(FILE *capture, FILE *fallback)
         if (ch == EOF || ch == '\n') {
             line[length] = '\0';
             if (length > 0UL || ch == '\n') {
+                unsigned long mi;
+                long end_offset = ftell(capture);
+
                 tg_console_tui_line(fallback, line);
+                if (capture == tg_tui_mark_capture) {
+                    for (mi = 0UL; mi < tg_tui_capture_mark_count; ++mi) {
+                        if (tg_tui_capture_marks[mi].end_offset == end_offset) {
+                            tg_tui_webpages[(tg_tui_backlog_total - 1UL) %
+                                           TG_TUI_BACKLOG_LINES] = tg_tui_capture_marks[mi];
+                        }
+                    }
+                }
             }
             length = 0UL;
             if (ch == EOF) {
@@ -1631,6 +1747,10 @@ void tg_console_tui_capture_end(FILE *capture, FILE *fallback)
         }
         length = tg_console_tui_line_push(fallback, line, sizeof(line),
                                           length, (char)ch);
+    }
+    if (capture == tg_tui_mark_capture) {
+        tg_tui_mark_capture = 0;
+        tg_tui_capture_mark_count = 0UL;
     }
     fclose(capture);
 }
@@ -1948,6 +2068,65 @@ static int tg_tui_line_push_self_test(void)
     return ok;
 }
 
+static int tg_tui_webpage_self_test(void)
+{
+    FILE *stream = tmpfile();
+    FILE *capture;
+    unsigned long start = tg_tui_backlog_total;
+    unsigned long total;
+    unsigned long i;
+    unsigned int saved_rows = tg_tui_rows;
+    unsigned int saved_columns = tg_tui_columns;
+    unsigned int saved_composer = tg_tui_composer_rows;
+    int saved_active = tg_tui_active;
+    int ok;
+
+    if (stream == 0) return 0;
+    tg_tui_rows = 20U;
+    tg_tui_columns = 80U;
+    tg_tui_composer_rows = 1U;
+    tg_tui_active = 1;
+    capture = tg_console_tui_capture_begin(stream);
+    fputs("pending link\n", capture);
+    tg_console_tui_capture_webpage(capture, 7UL, 9UL, 0UL, 42UL);
+    fputs("following message\n", capture);
+    tg_console_tui_capture_end(capture, stream);
+    total = tg_tui_backlog_total;
+    ok = total == start + 2UL &&
+        !tg_console_tui_complete_webpage(stream, 8UL,9UL,0UL,42UL,"unknown") &&
+        !tg_console_tui_complete_webpage(stream, 7UL,9UL,0UL,43UL,"wrong channel") &&
+        tg_tui_backlog_total == total &&
+        tg_console_tui_complete_webpage(stream, 7UL,9UL,0UL,42UL,
+            "[Link: Test site - Late title]\nFirst description.") &&
+        tg_tui_backlog_total == total + 2UL &&
+        strcmp(tg_tui_backlog[start % TG_TUI_BACKLOG_LINES], "pending link") == 0 &&
+        strcmp(tg_tui_backlog[(start+1UL) % TG_TUI_BACKLOG_LINES],
+               "[Link: Test site - Late title]") == 0 &&
+        strcmp(tg_tui_backlog[(start+2UL) % TG_TUI_BACKLOG_LINES],
+               "First description.") == 0 &&
+        strcmp(tg_tui_backlog[(start+3UL) % TG_TUI_BACKLOG_LINES],
+               "following message") == 0 &&
+        !tg_console_tui_complete_webpage(stream, 7UL,9UL,0UL,42UL,"duplicate");
+    /* The id leaves with its cache slot; it must never attach to the new row. */
+    capture = tg_console_tui_capture_begin(stream);
+    fputs("evicted link\n", capture);
+    tg_console_tui_capture_webpage(capture, 7UL, 10UL, 0UL, 0UL);
+    tg_console_tui_capture_end(capture, stream);
+    for (i = 0UL; i < TG_TUI_BACKLOG_LINES; ++i) {
+        tg_console_tui_line(stream, "new row");
+    }
+    total = tg_tui_backlog_total;
+    ok = ok && !tg_console_tui_complete_webpage(stream, 7UL,10UL,0UL,0UL,"stale") &&
+        tg_tui_backlog_total == total;
+    fclose(stream);
+    tg_tui_active = saved_active;
+    tg_tui_rows = saved_rows;
+    tg_tui_columns = saved_columns;
+    tg_tui_composer_rows = saved_composer;
+    if (!ok) puts("tui layout self-test: delayed webpage cache failed");
+    return ok;
+}
+
 int tg_console_tui_layout_self_test(void)
 {
     static const char words[] =
@@ -2032,7 +2211,10 @@ int tg_console_tui_layout_self_test(void)
     if (!tg_tui_line_push_self_test()) {
         return 2;
     }
-    puts("tui layout self-test: ok (wrap + incremental composer + long lines)");
+    if (!tg_tui_webpage_self_test()) {
+        return 2;
+    }
+    puts("tui layout self-test: ok (wrap + incremental composer + long lines + webpages)");
     return 0;
 }
 

@@ -89,7 +89,9 @@ fill_platform_text() {
    Telegram sends you. That code usually does NOT arrive by SMS: if you are
    signed in to Telegram anywhere else (phone, PC, web), it is delivered
    INSIDE Telegram, as a message from the official Telegram service chat.
-   The client tells you on screen where it was sent.
+   The client tells you on screen where it was sent. If nothing arrives,
+   wait until the code screen offers another way and press S: Telegram
+   then sends the code again, usually by SMS.
    If your account has a cloud password (2FA), type it on the masked screen
    (if you do NOT have one, just press Enter to continue).
 3. The client logs in and writes telegram-auth.bin in this drawer. After that
@@ -101,6 +103,8 @@ fill_platform_text() {
    SMS: se sei collegato a Telegram da qualche altra parte (telefono, PC,
    web), te lo consegna DENTRO Telegram, come messaggio della chat
    ufficiale Telegram. Il client ti dice a schermo dove e' stato spedito.
+   Se non arriva nulla, aspetta che la schermata del codice proponga
+   un'altra via e premi S: Telegram lo rimanda, di solito via SMS.
    Se il tuo account ha una password cloud (2FA), digitala sulla schermata
    mascherata (se NON ce l'hai, premi Invio).
 3. Il client accede e scrive telegram-auth.bin in questo drawer. Da li' in poi
@@ -232,7 +236,9 @@ then double-click TelegramAmiga-TUI."
    Telegram sends you. That code usually does NOT arrive by SMS: if you are
    signed in to Telegram anywhere else (phone, PC, web), it is delivered
    INSIDE Telegram, as a message from the official Telegram service chat.
-   The client tells you on screen where it was sent.
+   The client tells you on screen where it was sent. If nothing arrives,
+   wait until the code screen offers another way and press S: Telegram
+   then sends the code again, usually by SMS.
    If your account has a cloud password (2FA), type it on the masked screen
    (if you do NOT have one, just press Enter to continue).
 3. The client logs in and writes telegram-auth.bin in this drawer. After that
@@ -244,6 +250,8 @@ then double-click TelegramAmiga-TUI."
    SMS: se sei collegato a Telegram da qualche altra parte (telefono, PC,
    web), te lo consegna DENTRO Telegram, come messaggio della chat
    ufficiale Telegram. Il client ti dice a schermo dove e' stato spedito.
+   Se non arriva nulla, aspetta che la schermata del codice proponga
+   un'altra via e premi S: Telegram lo rimanda, di solito via SMS.
    Se il tuo account ha una password cloud (2FA), digitala sulla schermata
    mascherata (se NON ce l'hai, premi Invio).
 3. Il client accede e scrive telegram-auth.bin in questo drawer. Da li' in poi
@@ -494,15 +502,24 @@ Using the GUI
   as one complete coarse image, then refines through sharper quality passes;
   the same window is reused. The larger cache has a -l.jpg suffix in photos/.
 - Right-click a photo (or its [Photo] label) and choose "Save photo as..." to
-  keep the original JPEG under any drawer and name. Press S in the open viewer
-  for the same requester. An uncached photo is fetched first; replacing an
-  existing file always requires confirmation.
-- On AmigaOS 3, the first-run default is off when no RTG screen is available or
-  the CPU is below a 68040; every explicit toggle overrides that default and is
+  save the received image under any drawer and name. The suggested extension
+  follows the bytes: .png for PNG, .jpg for JPEG, with no conversion. Press S
+  in the open viewer for the same requester. An uncached image is fetched
+  before the requester opens; replacing an existing file requires confirmation.
+- The first-run default is off on native AGA/ECS/OCS screens (also on classic
+  OS4) or when the 68k CPU is below a 68040; explicit toggles override it and are
   remembered. On any slower machine, uncheck "Settings > Show inline photos".
   The conversation returns to lightweight [Photo] labels and does no background
   photo fetch or decode work. Click an individual [Photo] label to load only
   that image in the viewer. The choice is remembered for the next run.
+- "Settings > Enable emoji" controls the picker, its composer button and
+  graphical emoji in messages. Off closes the picker, restores text emoticons
+  and keeps any emoji already entered in the composer. Its choice is saved
+  independently of photos. It defaults off on AGA/ECS/OCS screens (including
+  classic OS4) or 68k CPUs below 68040; a manual choice overrides it. When
+  enabled, emoji are at least 16 pixels, including with Topaz 8 on OS3. The
+  font stays unchanged and the rows make room; Off restores compact text rows.
+  Avatar sizes stay unchanged when switching emoji on or off.
 - Videos show a frame and a pasted link shows its preview, with the picture
   when the page has one. Both go through the same photo pipeline, so the same
   "Show inline photos" setting governs them. Stickers show the emoji they
@@ -522,7 +539,16 @@ Using the GUI
   File or Cancel; ESC also cancels. The file's own bytes decide, not its name,
   and Telegram's photo limits (width plus height at most 10000, at most 20:1)
   are checked before anything is uploaded. A photo over 10 MiB is preserved
-  and sent as a document instead.
+  and sent as a document instead. Telegram can re-encode photos as JPEG;
+  choose File, then Download, to preserve an original PNG unchanged.
+- The paperclip at the left of the composer opens the attachment chooser.
+  JPEG/PNG attachments offer Photo, File or Cancel with a caption; other files
+  use normal file upload. The button also works with emoji and photos disabled.
+- "Insert emoji..." in the Telegram menu (Amiga+E), or the smiley button next
+  to Send, opens a panel above the composer: the recent ones first, then the
+  whole set. Arrow keys move, ENTER
+  inserts and keeps the panel open, ESC closes it; a click inserts too. In the
+  composer an emoji shows as a small picture and is edited as one character.
 - Right-click a message and choose "Forward to Saved Messages" for a one-click
   cloud copy, or "Forward to..." to select another chat with the normal search.
 - In groups, type @ in the composer to autocomplete a member: a small list
@@ -599,6 +625,9 @@ Contributions: Javier de las Rivas (javierdlr).
 Thanks to the testers around the world who run this on real hardware and
 send back what they find -- this client is what it is because of them.
 
+The emoji pictures are Noto Emoji glyphs (Google, SIL Open Font License
+1.1) reduced to sixteen pixels; the licence text ships in the archive.
+
 License: MIT -- a non-commercial community project. Diary:
 https://androidlab.it/en/telegram-amiga-mtproto-client-development-diary/
 EOF
@@ -667,16 +696,26 @@ Usare la GUI
   piu' nitide; la stessa finestra viene riutilizzata. La copia grande in
   photos/ ha il suffisso -l.jpg.
 - Click destro su una foto (o sulla sua etichetta [Photo]) e scegli
-  "Save photo as..." per salvare il JPEG originale con drawer e nome a scelta.
-  Nel viewer premi S per aprire lo stesso requester. Se la foto non e' in cache
-  viene prima scaricata; la sostituzione di un file esistente chiede conferma.
-- Su AmigaOS 3 il primo avvio parte senza foto inline quando non e' disponibile
-  uno schermo RTG oppure la CPU e' inferiore al 68040; ogni scelta esplicita
+  "Save photo as..." per salvare l'immagine ricevuta con drawer e nome a scelta.
+  L'estensione suggerita segue i byte: .png per PNG, .jpg per JPEG, senza
+  conversioni. Nel viewer premi S per lo stesso requester. Se la foto non e'
+  in cache viene scaricata prima di aprirlo; sostituire un file chiede conferma.
+- Il primo avvio parte senza foto inline su schermi AGA/ECS/OCS (anche OS4
+  classic) oppure con CPU 68k inferiore al 68040; ogni scelta esplicita
   sostituisce il default e resta memorizzata. Su una macchina lenta togli la
   spunta da "Settings > Show inline photos" nel menu
   Telegram. La conversazione torna alle leggere etichette [Photo] e non avvia
   download o decodifiche in background. Clicca una singola [Photo] per caricare
   solo quella immagine nel viewer. La scelta resta memorizzata al riavvio.
+- "Settings > Enable emoji" controlla il pannello, la faccina del composer e
+  le emoji grafiche nei messaggi. Off chiude il pannello, mostra emoticon
+  testuali e conserva le emoji gia' inserite nel composer. La scelta viene
+  salvata separatamente dalle foto. Parte spento su schermi AGA/ECS/OCS
+  (anche OS4 classic) oppure con CPU 68k sotto il 68040; una scelta manuale
+  sostituisce il default. Quando attivo le emoji sono di almeno 16 pixel,
+  anche con Topaz 8 su OS3: il font resta uguale e le righe fanno spazio.
+  Off ripristina le righe compatte con emoticon testuali.
+  La dimensione degli avatar resta uguale attivando o disattivando le emoji.
 - I video mostrano un fotogramma e un link incollato mostra la sua anteprima,
   con l'immagine se la pagina ne ha una. Passano dalla stessa pipeline delle
   foto, quindi li governa la stessa impostazione "Show inline photos". Gli
@@ -697,7 +736,16 @@ Usare la GUI
   scegliere Photo, File o Cancel; anche ESC annulla. Decidono i byte del file,
   non il nome, e i limiti Telegram per le foto (larghezza piu' altezza al
   massimo 10000, al massimo 20:1) sono controllati prima di caricare. Oltre
-  10 MiB viene inviato come file.
+  10 MiB viene inviato come file. Telegram puo' ricodificare le foto in JPEG;
+  scegli File e poi Download per conservare una PNG originale senza modifiche.
+- La graffetta a sinistra del composer apre il selettore degli allegati.
+  JPEG e PNG offrono Photo, File o Cancel con didascalia; gli altri file
+  seguono l'invio normale. Funziona anche con emoji e foto disabilitate.
+- "Insert emoji..." nel menu Telegram (Amiga+E), o la faccina accanto a
+  Send, apre un pannello sopra il composer: prima le emoji recenti, poi tutte. Le frecce si muovono, ENTER
+  inserisce e lascia il pannello aperto, ESC lo chiude; anche un click
+  inserisce. Nel composer un'emoji appare come una piccola figura e si
+  modifica come un carattere solo.
 - Click destro su un messaggio: "Forward to Saved Messages" lo copia con un
   click nel proprio cloud; "Forward to..." permette di scegliere un'altra chat
   usando la ricerca normale.
@@ -1019,6 +1067,11 @@ package_one() {
     write_manual_en "$dest/Manual-EN.txt" "$platform"
     write_manual_it "$dest/Manuale-IT.txt" "$platform"
     cp "$ROOT_DIR/LICENSE" "$dest/LICENSE"
+    # The emoji sheet is derived from Noto Emoji (OFL 1.1): the licence and the
+    # notice travel with every package, next to our own MIT text, so the
+    # credit line in the readme points at something the user actually has.
+    cp "$ROOT_DIR/third_party/noto-emoji/LICENSE" "$dest/LICENSE-NotoEmoji.txt"
+    cp "$ROOT_DIR/third_party/noto-emoji/NOTICE.txt" "$dest/NOTICE-NotoEmoji.txt"
     # Full changelog in every package (release rule since 0.0.8): the repo
     # CHANGELOG.md is the single source; refuse to package a release whose
     # version is not in it yet (the Unreleased section must be promoted).

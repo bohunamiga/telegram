@@ -29,6 +29,7 @@
 #include "tg_chat_engine.h"
 #include "tg_mtproto_message_id.h"
 #include "tg_mtproto_probe.h"
+#include "tg_emoji_sheet.h"
 #include "tg_mtproto_rsa.h"
 #include "tg_mtproto_session.h"
 #include "tg_mtproto_srp.h"
@@ -58,6 +59,8 @@
 #define tg_gui_driver_has_unseen_own(gui) (0)
 #define tg_gui_driver_update_text(gui, message_id, text) (0)
 #define tg_gui_driver_update_text_utf8(gui, message_id, text) (0)
+#define tg_gui_driver_set_pending_webpage(gui, msg, hi, lo) ((void)0)
+#define tg_gui_driver_apply_webpage(gui, page, ready) ((void)0, (void)(page), (void)(ready), 0)
 #define tg_gui_driver_remove_by_id(gui, message_id) (0)
 #define tg_gui_driver_mark_photo_ready(gui, id_hi, id_lo) (0)
 #endif
@@ -98,6 +101,10 @@ static char tg_mtproto_query_fail[64];
 /* Defined by the upload engine further down; the text client and the GUI
    session accessor both put a server refusal into words. */
 static const char *tg_mtproto_upload_failure_text(const char *raw);
+#if TG_MTPROTO_DISPLAY_LATIN1
+static int tg_mtproto_latin1_to_utf8(const char *src, char *dst,
+                                     unsigned long dst_size);
+#endif
 
 /*
  * Consecutive failed reads/sends in the interactive chat loop before it drops
@@ -167,6 +174,10 @@ static const char *tg_mtproto_upload_failure_text(const char *raw);
 #define TG_MTPROTO_UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR 0x62ba04d9UL
 #define TG_MTPROTO_UPDATE_EDIT_MESSAGE_CONSTRUCTOR 0xe40370a3UL
 #define TG_MTPROTO_UPDATE_EDIT_CHANNEL_MESSAGE_CONSTRUCTOR 0x1b3f4df7UL
+/* https://core.telegram.org/constructor/updateWebPage and
+   /constructor/updateChannelWebPage, verified 2026-09-08 (layer 214). */
+#define TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR 0x7f891213UL
+#define TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR 0x2f2ba99fUL
 #define TG_MTPROTO_MESSAGE_CONSTRUCTOR 0x9815cec8UL
 #define TG_MTPROTO_TL_VECTOR_CONSTRUCTOR 0x1cb5c415UL
 #define TG_MTPROTO_UPDATES_TOO_LONG_CONSTRUCTOR 0xe317af7eUL
@@ -428,12 +439,25 @@ typedef struct tg_chat_edit_entry {
     unsigned long peer_id_lo;
     unsigned long message_id;
     char text[TG_GUI_MSG_TEXT_MAX];
+    unsigned long pending_webpage_hi;
+    unsigned long pending_webpage_lo;
 } tg_chat_edit_entry;
 typedef struct tg_chat_edit_sink {
     tg_chat_edit_entry queue[TG_CHAT_EDIT_QUEUE_MAX];
     unsigned long count;
 } tg_chat_edit_sink;
 static tg_chat_edit_sink *tg_chat_edit_target = 0;
+/* Defer application until the receive call returns: an update can arrive
+   during sendMessage, before the optimistic echo has entered the ring. */
+#define TG_CHAT_WEBPAGE_QUEUE_MAX 8U
+typedef struct tg_chat_webpage_entry {
+    unsigned long channel_hi;
+    unsigned long channel_lo;
+    tg_mtproto_web_page page;
+} tg_chat_webpage_entry;
+static tg_chat_webpage_entry tg_chat_webpages[TG_CHAT_WEBPAGE_QUEUE_MAX];
+static unsigned long tg_chat_webpage_count = 0UL;
+static tg_mtproto_web_page tg_chat_sent_webpage;
 /* The real console stream while the chat runs, for TUI components that must
    bypass capture streams (input-row redraws from the editor and the
    sub-prompts). 0 outside the chat. */
@@ -1872,10 +1896,41 @@ static const char *tg_mtproto_sent_code_text(unsigned long type_constructor,
     case 0xf450f59bUL: /* auth.sentCodeTypeEmailCode */
         return brief ? "Code sent to your email"
                      : "Check your email for the code.";
+    case 0xa5491deaUL: /* auth.sentCodeTypeSetUpEmailRequired */
+        /* Telegram sends NOTHING here: the account must add and verify a
+           login email before it will hand out codes again. A field report
+           (AROS, 0.0.92) waited for a code that was never coming, because
+           this answer used to fall into the default below and read like any
+           other "enter the code". */
+        return brief ? "Telegram wants a login email first"
+                     : "No code is coming: Telegram wants this account to add"
+                       " and verify a login email. Do that once in an official"
+                       " Telegram app, then sign in here again.";
     default:
-        /* Unknown delivery type: the GUI still needs a prompt, the console
-           stays silent rather than mislead. */
-        return brief ? "Enter the code you received" : 0;
+        /* A delivery type this build does not know. Say so: pretending a
+           code is on its way is what wasted a tester's afternoon. The
+           console prints the constructor as well, from the caller. */
+        return brief ? "Telegram did not say where it sent the code" : 0;
+    }
+}
+
+/* The route auth.resendCode would take, from the auth.CodeType Telegram put
+   in next_type (core.telegram.org/type/auth.CodeType, 2026-09-11). */
+static const char *tg_mtproto_code_route_text(unsigned long code_type)
+{
+    switch (code_type) {
+    case 0x72a3158cUL: /* auth.codeTypeSms */
+        return "by SMS";
+    case 0x741cd3e3UL: /* auth.codeTypeCall */
+        return "by phone call";
+    case 0x226ccefbUL: /* auth.codeTypeFlashCall */
+        return "by a flash call";
+    case 0xd61ad6eeUL: /* auth.codeTypeMissedCall */
+        return "by a missed call";
+    case 0x06ed998cUL: /* auth.codeTypeFragmentSms */
+        return "via fragment.com";
+    default:
+        return 0;
     }
 }
 
@@ -1889,6 +1944,10 @@ static void tg_mtproto_print_login_code_hint(FILE *stream,
     }
     hint = tg_mtproto_sent_code_text(type_constructor, 0);
     if (hint == 0) {
+        /* Unknown type: the number is the only useful thing we have, and it
+           is what turns "no code arrived" into a five minute diagnosis. */
+        fprintf(stream, "Telegram did not say where it sent the code"
+                        " (delivery type 0x%08lx).\n", type_constructor);
         return;
     }
     fprintf(stream, "%s\n", hint);
@@ -3204,6 +3263,8 @@ static void tg_chat_edit_parse_update(tg_mtproto_tl_reader *reader)
     }
     memcpy(entry->text, message.text, copy_length);
     entry->text[copy_length] = '\0';
+    entry->pending_webpage_hi = message.pending_webpage_hi;
+    entry->pending_webpage_lo = message.pending_webpage_lo;
 }
 
 static int tg_chat_edit_peer_matches_open(const tg_chat_edit_entry *entry,
@@ -3226,6 +3287,42 @@ static int tg_chat_edit_peer_matches_open(const tg_chat_edit_entry *entry,
            entry->peer_constructor == TG_MTPROTO_PEER_USER_CONSTRUCTOR;
 }
 
+static void tg_chat_webpage_parse_update(tg_mtproto_tl_reader *reader,
+                                          unsigned long constructor)
+{
+    static tg_chat_webpage_entry parsed;
+    unsigned long i;
+
+    memset(&parsed, 0, sizeof(parsed));
+    if (constructor == TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR &&
+        tg_mtproto_tl_read_u64(reader, &parsed.channel_hi,
+                               &parsed.channel_lo) != TG_MTPROTO_TL_OK) {
+        return;
+    }
+    if (tg_mtproto_read_web_page(reader, &parsed.page) != TG_MTPROTO_TL_OK ||
+        parsed.page.pending ||
+        (parsed.page.id_hi == 0UL && parsed.page.id_lo == 0UL) ||
+        reader->length - reader->offset < 8UL) {
+        return;
+    }
+    for (i = 0UL; i < tg_chat_webpage_count; ++i) {
+        if (tg_chat_webpages[i].channel_hi == parsed.channel_hi &&
+            tg_chat_webpages[i].channel_lo == parsed.channel_lo &&
+            tg_chat_webpages[i].page.id_hi == parsed.page.id_hi &&
+            tg_chat_webpages[i].page.id_lo == parsed.page.id_lo) {
+            tg_chat_webpages[i] = parsed;
+            return;
+        }
+    }
+    if (tg_chat_webpage_count == TG_CHAT_WEBPAGE_QUEUE_MAX) {
+        memmove(tg_chat_webpages, tg_chat_webpages + 1,
+                (TG_CHAT_WEBPAGE_QUEUE_MAX - 1U) * sizeof(*tg_chat_webpages));
+        --tg_chat_webpage_count;
+    }
+    tg_chat_webpages[tg_chat_webpage_count++] = parsed;
+    tg_gui_log("webpage: update queued");
+}
+
 /* A Vector<Update> is not length-prefixed per item. The normal collector can
    therefore consume only its first known item safely: a Message parser may
    intentionally stop after text when optional media/reply fields follow.
@@ -3241,8 +3338,7 @@ static void tg_chat_edit_scan_updates(const unsigned char *body,
     unsigned long constructor;
     unsigned long offset;
 
-    if (tg_chat_edit_target == 0 || body == 0 ||
-        start_offset >= body_length) {
+    if (body == 0 || start_offset >= body_length) {
         return;
     }
     offset = (start_offset + 3UL) & ~3UL;
@@ -3254,6 +3350,11 @@ static void tg_chat_edit_scan_updates(const unsigned char *body,
             tg_mtproto_tl_reader_init(&reader, body, body_length);
             reader.offset = offset + 4UL;
             tg_chat_edit_parse_update(&reader);
+        } else if (constructor == TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR ||
+                   constructor == TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR) {
+            tg_mtproto_tl_reader_init(&reader, body, body_length);
+            reader.offset = offset + 4UL;
+            tg_chat_webpage_parse_update(&reader, constructor);
         }
         offset += 4UL;
     }
@@ -3265,6 +3366,11 @@ static void tg_chat_edit_scan_updates(const unsigned char *body,
 static void tg_chat_collect_update_item(tg_mtproto_tl_reader *reader,
                                         unsigned long update_ctor)
 {
+    if (update_ctor == TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR ||
+        update_ctor == TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR) {
+        tg_chat_webpage_parse_update(reader, update_ctor);
+        return;
+    }
     if (update_ctor == TG_MTPROTO_UPDATE_USER_TYPING_CONSTRUCTOR ||
         update_ctor == TG_MTPROTO_UPDATE_CHAT_USER_TYPING_CONSTRUCTOR ||
         update_ctor == TG_MTPROTO_UPDATE_CHANNEL_USER_TYPING_CONSTRUCTOR) {
@@ -3343,7 +3449,9 @@ static void tg_chat_notify_collect_updates(const unsigned char *body,
             TG_MTPROTO_TL_OK) {
             return;
         }
-        if (item_constructor != TG_MTPROTO_UPDATE_USER_TYPING_CONSTRUCTOR &&
+        if (item_constructor != TG_MTPROTO_UPDATE_WEBPAGE_CONSTRUCTOR &&
+            item_constructor != TG_MTPROTO_UPDATE_CHANNEL_WEBPAGE_CONSTRUCTOR &&
+            item_constructor != TG_MTPROTO_UPDATE_USER_TYPING_CONSTRUCTOR &&
             item_constructor !=
                 TG_MTPROTO_UPDATE_CHAT_USER_TYPING_CONSTRUCTOR &&
             item_constructor !=
@@ -3707,12 +3815,23 @@ static int tg_mtproto_send_saved_query(const char *host,
    already, and until now thrown away. */
 static unsigned long tg_mtproto_sent_code_type;
 static unsigned long tg_mtproto_sent_code_len;
+/* ...and what Telegram offers when it does not arrive: the next route
+   (auth.CodeType, 0 = none), the seconds to wait before asking for it, and
+   when the answer came, so the wait can be counted down. */
+static unsigned long tg_mtproto_sent_code_next;
+static unsigned long tg_mtproto_sent_code_wait;
+static unsigned long tg_mtproto_sent_code_at;
 
 static void tg_mtproto_remember_sent_code(const tg_mtproto_sent_code *sc)
 {
     tg_mtproto_sent_code_type = (sc != 0) ? sc->type_constructor : 0UL;
     tg_mtproto_sent_code_len =
         (sc != 0 && sc->has_type_length) ? sc->type_length : 0UL;
+    tg_mtproto_sent_code_next =
+        (sc != 0 && sc->has_next_type) ? sc->next_type : 0UL;
+    tg_mtproto_sent_code_wait =
+        (sc != 0 && sc->has_timeout) ? sc->timeout : 0UL;
+    tg_mtproto_sent_code_at = (unsigned long)time(0);
 }
 
 const char *tg_mtproto_sent_code_hint(void)
@@ -3723,6 +3842,22 @@ const char *tg_mtproto_sent_code_hint(void)
 unsigned long tg_mtproto_sent_code_length(void)
 {
     return tg_mtproto_sent_code_len;
+}
+
+const char *tg_mtproto_sent_code_next_route(void)
+{
+    return tg_mtproto_code_route_text(tg_mtproto_sent_code_next);
+}
+
+unsigned long tg_mtproto_sent_code_resend_wait(void)
+{
+    unsigned long now = (unsigned long)time(0);
+    unsigned long ready = tg_mtproto_sent_code_at + tg_mtproto_sent_code_wait;
+
+    if (tg_mtproto_sent_code_wait == 0UL || now >= ready) {
+        return 0UL;
+    }
+    return ready - now;
 }
 
 int tg_mtproto_auth_send_code(const char *host,
@@ -4070,6 +4205,207 @@ int tg_mtproto_auth_sign_in_file(const char *host,
                                  code_hash_file, phone_code, dc_id_text,
                                  stream);
     return rc;
+}
+
+/* auth.resendCode, on the auth key that asked for the code (the
+   phone_code_hash belongs to it, so this loads the saved context like signIn
+   does), then the same bookkeeping as sendCode: remember the new route,
+   store the new hash, say where the code went. The refusals come back as
+   short sentences with "failed" in them, which is what the GUI's quiet
+   stream picks up for its status line. 0 = sent again. */
+int tg_mtproto_auth_resend_code(const char *host,
+                                const char *port,
+                                const char *api_id_text,
+                                const char *auth_file,
+                                const char *phone_number,
+                                const char *code_hash_file,
+                                const char *dc_id_text,
+                                FILE *stream)
+{
+    unsigned char query[512];
+    unsigned char initialized_query[640];
+    unsigned char wrapped_query[760];
+    char code_hash[160];
+    unsigned long code_hash_length;
+    unsigned long api_id;
+    unsigned long query_length;
+    tg_file_status file_status;
+    tg_mtproto_auth_context context;
+    tg_mtproto_rpc_result result;
+    tg_mtproto_sent_code sent_code;
+    tg_mtproto_session_status session_status;
+    tg_mtproto_tl_writer writer;
+    long dc_id;
+    int qrc;
+    static const char label[] = "mtproto auth.resendCode";
+
+    if (stream == 0 || host == 0 || port == 0 || api_id_text == 0 ||
+        auth_file == 0 || phone_number == 0 || code_hash_file == 0 ||
+        tg_mtproto_parse_dc_id(dc_id_text, &dc_id) != 0 ||
+        tg_mtproto_parse_ulong_arg(api_id_text, &api_id) != 0) {
+        if (stream != 0) {
+            fputs("mtproto auth.resendCode: invalid-arguments\n", stream);
+        }
+        return 2;
+    }
+    file_status = tg_file_read_text(code_hash_file, code_hash,
+                                    sizeof(code_hash), &code_hash_length);
+    if (file_status != TG_FILE_OK) {
+        fprintf(stream, "%s: code-hash-load-failed (%s)\n", label,
+                tg_file_status_name(file_status));
+        return 2;
+    }
+    tg_mtproto_trim_line(code_hash);
+    if (code_hash[0] == '\0') {
+        fprintf(stream, "%s: code-hash-empty\n", label);
+        return 2;
+    }
+    if (tg_mtproto_load_auth_context(host, port, auth_file, &context, stream,
+                                     label) != 0) {
+        return 2;
+    }
+    context.session.dc_id = (unsigned long)dc_id;
+
+    tg_mtproto_login_phase(stream, "auth.resendCode build");
+    tg_mtproto_tl_writer_init(&writer, query, sizeof(query));
+    if (tg_mtproto_build_auth_resend_code(&writer, phone_number, code_hash) !=
+        TG_MTPROTO_TL_OK) {
+        tg_mtproto_close_auth_context(&context);
+        fprintf(stream, "%s: query-build-failed\n", label);
+        return 2;
+    }
+    query_length = writer.length;
+    tg_mtproto_tl_writer_init(&writer, initialized_query,
+                              sizeof(initialized_query));
+    if (tg_mtproto_build_init_connection(&writer, api_id, "Amiga",
+                                         "portable", "0.1", "en", query,
+                                         query_length) != TG_MTPROTO_TL_OK) {
+        tg_mtproto_close_auth_context(&context);
+        fprintf(stream, "%s: init-connection-build-failed\n", label);
+        return 2;
+    }
+    query_length = writer.length;
+    tg_mtproto_tl_writer_init(&writer, wrapped_query, sizeof(wrapped_query));
+    if (tg_mtproto_build_invoke_with_layer(&writer, 214UL, initialized_query,
+                                           query_length) !=
+        TG_MTPROTO_TL_OK) {
+        tg_mtproto_close_auth_context(&context);
+        fprintf(stream, "%s: invoke-layer-build-failed\n", label);
+        return 2;
+    }
+
+    tg_mtproto_login_phase(stream, "auth.resendCode send");
+    qrc = tg_mtproto_send_encrypted_query_login(
+        &context, wrapped_query, writer.length, &result, stream, label);
+    if (qrc != 0) {
+        if (qrc == TG_MTPROTO_QUERY_SOFT_FAIL) {
+            session_status = tg_mtproto_session_save_authorization(
+                auth_file, &context.session, context.auth_key, 1);
+            if (session_status != TG_MTPROTO_SESSION_OK) {
+                fprintf(stream, "%s: auth-file-save-failed (%s)\n", label,
+                        tg_mtproto_session_status_name(session_status));
+            }
+        }
+        tg_mtproto_close_auth_context(&context);
+        return 2;
+    }
+    tg_mtproto_login_phase(stream, "auth.resendCode response");
+    tg_mtproto_skip_auth_context_close(&context, stream, label);
+
+    session_status = tg_mtproto_session_save_authorization(
+        auth_file, &context.session, context.auth_key, 1);
+    if (session_status != TG_MTPROTO_SESSION_OK) {
+        fprintf(stream, "%s: auth-file-save-failed (%s)\n", label,
+                tg_mtproto_session_status_name(session_status));
+        return 2;
+    }
+
+    if (result.result_constructor == TG_MTPROTO_RPC_ERROR_CONSTRUCTOR) {
+        char resend_error[128];
+        long resend_error_code;
+
+        if (tg_mtproto_parse_rpc_error(result.result_body - 4U,
+                                       result.result_body_length + 4U,
+                                       &resend_error_code, resend_error,
+                                       sizeof(resend_error)) ==
+            TG_MTPROTO_TL_OK) {
+            if (strcmp(resend_error, "SEND_CODE_UNAVAILABLE") == 0) {
+                fputs("Resend failed: no other way to send it\n", stream);
+                return 2;
+            }
+            if (strcmp(resend_error, "PHONE_CODE_EXPIRED") == 0) {
+                fputs("Resend failed: the code expired, press ESC\n",
+                      stream);
+                return 2;
+            }
+            if (strncmp(resend_error, "FLOOD_WAIT_", 11) == 0) {
+                fprintf(stream, "Resend failed: too many tries, wait %.10s s\n",
+                        resend_error + 11);
+                return 2;
+            }
+        }
+        if (!tg_mtproto_print_rpc_error(label, &result, stream)) {
+            fprintf(stream, "%s: rpc-error-parse-failed\n", label);
+        }
+        return 2;
+    }
+    if (tg_mtproto_unpack_gzip_result(&result, stream, label) != 0) {
+        return 2;
+    }
+    if (result.result_constructor != TG_MTPROTO_AUTH_SENT_CODE_CONSTRUCTOR &&
+        result.result_constructor !=
+            TG_MTPROTO_AUTH_SENT_CODE_PAYMENT_REQUIRED_CONSTRUCTOR &&
+        result.result_constructor !=
+            TG_MTPROTO_AUTH_SENT_CODE_SUCCESS_CONSTRUCTOR) {
+        fprintf(stream, "%s: unexpected-result 0x%08lx\n", label,
+                result.result_constructor);
+        return 2;
+    }
+    if (tg_mtproto_parse_auth_sent_code(result.result_constructor,
+                                        result.result_body,
+                                        result.result_body_length,
+                                        &sent_code) != TG_MTPROTO_TL_OK ||
+        sent_code.phone_code_hash[0] == '\0') {
+        fprintf(stream, "%s: sent-code-parse-failed\n", label);
+        return 2;
+    }
+    tg_mtproto_remember_sent_code(&sent_code);
+    file_status = tg_file_write_text(code_hash_file, sent_code.phone_code_hash,
+                                     (unsigned long)strlen(
+                                         sent_code.phone_code_hash));
+    if (file_status == TG_FILE_OK) {
+        file_status = tg_file_append_text(code_hash_file, "\n", 1UL);
+    }
+    if (file_status != TG_FILE_OK) {
+        fprintf(stream, "%s: code-hash-save-failed (%s)\n", label,
+                tg_file_status_name(file_status));
+        return 2;
+    }
+    fprintf(stream, "Login code sent again.\n");
+    tg_mtproto_print_login_code_hint(stream, sent_code.type_constructor);
+    fflush(stream);
+    return 0;
+}
+
+int tg_mtproto_auth_resend_code_file(const char *host,
+                                     const char *port,
+                                     const char *api_file,
+                                     const char *auth_file,
+                                     const char *phone_number,
+                                     const char *code_hash_file,
+                                     const char *dc_id_text,
+                                     FILE *stream)
+{
+    char api_id[32];
+    static const char label[] = "mtproto auth.resendCode";
+
+    if (tg_mtproto_load_api_id_file(api_file, api_id, sizeof(api_id),
+                                    stream, label) != 0) {
+        return 2;
+    }
+    return tg_mtproto_auth_resend_code(host, port, api_id, auth_file,
+                                       phone_number, code_hash_file,
+                                       dc_id_text, stream);
 }
 
 int tg_mtproto_auth_sign_up(const char *host,
@@ -4827,7 +5163,14 @@ int tg_mtproto_auth_login_wizard_file(const char *host,
        2FA challenge (which then failed confusingly on checkPassword). */
     rc = TG_MTPROTO_SIGN_IN_CODE_INVALID;
     while (rc == TG_MTPROTO_SIGN_IN_CODE_INVALID) {
+        const char *route =
+            tg_mtproto_code_route_text(tg_mtproto_sent_code_next);
+
         fprintf(stream, "Type the Telegram code and press Return.\n");
+        if (route != 0) {
+            fprintf(stream, "No code? Type S and press Return to get it %s.\n",
+                    route);
+        }
         fflush(stream);
         if (tg_mtproto_prompt_line("Telegram code (empty to abort): ", code,
                                    sizeof(code), 0, stream, label) != 0) {
@@ -4838,6 +5181,28 @@ int tg_mtproto_auth_login_wizard_file(const char *host,
             tg_mtproto_secure_zero(phone, sizeof(phone));
             fprintf(stream, "%s: aborted\n", label);
             return 2;
+        }
+        if ((code[0] == 's' || code[0] == 'S') && code[1] == '\0') {
+            /* The in-app code never came: ask Telegram for its next route
+               (auth.resendCode), as the official apps offer after a wait. */
+            unsigned long wait = tg_mtproto_sent_code_resend_wait();
+
+            tg_mtproto_secure_zero(code, sizeof(code));
+            if (route == 0) {
+                fprintf(stream,
+                        "Telegram offered no other way to send this code.\n");
+            } else if (wait > 0UL) {
+                fprintf(stream, "Telegram allows that in %lu seconds: "
+                                "type S again then.\n", wait);
+            } else {
+                fprintf(stream, "Asking Telegram to send the code %s.\n",
+                        route);
+                fflush(stream);
+                (void)tg_mtproto_auth_resend_code_file(
+                    current_host, port, api_file, auth_file, phone,
+                    code_hash_file, current_dc_id_text, stream);
+            }
+            continue;
         }
         fprintf(stream, "Checking Telegram code.\n");
         fflush(stream);
@@ -5541,6 +5906,17 @@ static const char *tg_mtproto_display_emoticon(unsigned long cp)
     }
 }
 
+const char *tg_gui_session_emoji_text(unsigned long index)
+{
+    const char *t;
+
+    if (index >= tg_emoji_sheet_count) {
+        return "?";
+    }
+    t = tg_mtproto_display_emoticon(tg_emoji_sheet_codepoints[index]);
+    return t != 0 ? t : "?";
+}
+
 /* Codepoints that only modify a neighbouring emoji print as nothing at all.
    Without this, "<heart><variation-selector>" rendered as two '?'. */
 int tg_mtproto_display_codepoint_is_invisible(unsigned long cp)
@@ -5760,6 +6136,33 @@ static int tg_mtproto_latin1_to_utf8(const char *src, char *dst,
     o = 0UL;
     for (i = 0UL; s[i] != '\0'; ++i) {
         unsigned char c = s[i];
+        unsigned long emoji;
+
+        /* An emoji pair from the composer (see tg_gui.h): two bytes in, the
+           codepoint's UTF-8 out, three or four bytes, still within the
+           "twice the input" bound this buffer is sized for. */
+        if ((c == TG_GUI_EMOJI_PREFIX0 || c == TG_GUI_EMOJI_PREFIX1) &&
+            s[i + 1U] != '\0' &&
+            tg_gui_emoji_pair_at(src, i + 2UL, i, &emoji) &&
+            emoji < tg_emoji_sheet_count) {
+            unsigned long cp = tg_emoji_sheet_codepoints[emoji];
+            unsigned long need = cp >= 0x10000UL ? 4UL : 3UL;
+
+            if (o + need >= dst_size) {
+                dst[0] = '\0';
+                return 0;
+            }
+            if (need == 4UL) {
+                dst[o++] = (char)(0xf0U | (cp >> 18));
+                dst[o++] = (char)(0x80U | ((cp >> 12) & 0x3fU));
+            } else {
+                dst[o++] = (char)(0xe0U | (cp >> 12));
+            }
+            dst[o++] = (char)(0x80U | ((cp >> 6) & 0x3fU));
+            dst[o++] = (char)(0x80U | (cp & 0x3fU));
+            ++i; /* the index byte */
+            continue;
+        }
         if (c < 0x80U) {
             if (o + 1UL >= dst_size) {
                 dst[0] = '\0';
@@ -8582,6 +8985,7 @@ static int tg_mtproto_auth_send_peer_on_context(
     int qrc;
     static const char label[] = "mtproto messages.sendMessage(peer)";
 
+    memset(&tg_chat_sent_webpage, 0, sizeof(tg_chat_sent_webpage));
     if (sent_message_id != 0) {
         *sent_message_id = 0UL;
     }
@@ -8648,6 +9052,7 @@ static int tg_mtproto_auth_send_peer_on_context(
     if (sent_message_id != 0 && updates.has_sent_message) {
         *sent_message_id = updates.id;
     }
+    tg_chat_sent_webpage = updates.webpage;
     return 0;
 }
 
@@ -9938,6 +10343,9 @@ static void tg_chat_console_on_message(void *ctx,
     tg_chat_console_driver *console = (tg_chat_console_driver *)ctx;
 
     tg_mtproto_chat_render_message(console->stream, row, console->day_shown);
+    tg_console_tui_capture_webpage(console->stream,
+                                   row->pending_webpage_hi, row->pending_webpage_lo,
+                                   row->webpage_channel_hi, row->webpage_channel_lo);
 }
 
 /* Golden parity harness for the transcript renderer. Drives
@@ -11133,6 +11541,12 @@ static int tg_mtproto_auth_print_history_text_peer_on_context(
                      texts.messages[i].reply_quote[0] != '\0')
                         ? texts.messages[i].reply_quote
                         : 0;
+                row.pending_webpage_hi = texts.messages[i].pending_webpage_hi;
+                row.pending_webpage_lo = texts.messages[i].pending_webpage_lo;
+                if (peer_constructor == TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR) {
+                    row.webpage_channel_hi = peer_id_hi;
+                    row.webpage_channel_lo = peer_id_lo;
+                }
                 row.id = texts.messages[i].id;
                 row.from_id_hi = texts.messages[i].from_id_hi;
                 row.from_id_lo = texts.messages[i].from_id_lo;
@@ -11775,6 +12189,32 @@ static void tg_mtproto_chat_load_own_label(const char *host,
     }
 }
 
+static int tg_mtproto_tui_apply_webpages(FILE *stream)
+{
+    unsigned long i;
+    int dirty = 0;
+
+    for (i = 0UL; i < tg_chat_webpage_count; ++i) {
+        tg_chat_webpage_entry *entry = &tg_chat_webpages[i];
+        char text[TG_MTPROTO_WEBPAGE_TEXT_MAX];
+        FILE *capture = tmpfile();
+        size_t n;
+
+        if (capture == 0) continue;
+        tg_mtproto_print_message_text(capture, entry->page.text);
+        rewind(capture);
+        n = fread(text, 1U, sizeof(text) - 1U, capture);
+        text[n] = '\0';
+        fclose(capture);
+        if (tg_console_tui_complete_webpage(stream, entry->page.id_hi,
+                entry->page.id_lo, entry->channel_hi, entry->channel_lo, text)) {
+            dirty = 1;
+        }
+    }
+    tg_chat_webpage_count = 0UL;
+    return dirty;
+}
+
 int tg_mtproto_auth_chat_file(const char *host,
                               const char *port,
                               const char *api_file,
@@ -11848,6 +12288,7 @@ int tg_mtproto_auth_chat_file(const char *host,
        init zeroes the updates cursor + notify queue and enables /diff. */
     tg_chat_engine_init(&chat_engine);
     tg_chat_nq = &chat_engine.notify;
+    tg_chat_webpage_count = 0UL;
     chat_quiet = 0;
     api_id[0] = '\0';
     saved_timeout = tg_net_connect_timeout_seconds();
@@ -12082,6 +12523,10 @@ int tg_mtproto_auth_chat_file(const char *host,
             line[0] = '\0';
             line_length = 0UL;
             tg_chat_caret = 0UL;
+        }
+        if (tg_mtproto_tui_apply_webpages(stream)) {
+            tg_mtproto_chat_show_prompt(stream, own_label, peer_label,
+                                        line, line_length, tg_chat_input_raw);
         }
         if (tg_console_tui_resize_pending()) {
             if (tg_console_tui_resize(stream, " Telegram Amiga ")) {
@@ -13247,6 +13692,18 @@ int tg_mtproto_auth_chat_file(const char *host,
             }
             tg_console_ui_reset(tui_cap);
             fputc('\n', tui_cap);
+            if (tg_chat_sent_webpage.pending) {
+                unsigned long pc, ph, pl, ah, al;
+                int has_hash;
+
+                if (tg_mtproto_load_peer_cache_peer(peer_cache_file, peer_index,
+                        &pc, &ph, &pl, &ah, &al, &has_hash, tui_cap, label) == 0) {
+                    tg_console_tui_capture_webpage(tui_cap,
+                        tg_chat_sent_webpage.id_hi, tg_chat_sent_webpage.id_lo,
+                        pc == TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR ? ph : 0UL,
+                        pc == TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR ? pl : 0UL);
+                }
+            }
             tg_console_tui_capture_end(tui_cap, stream);
         }
         tg_mtproto_chat_show_prompt(stream, own_label, peer_label, 0,
@@ -13899,6 +14356,7 @@ static int tg_gui_hidden_projection_self_test(void);
 #if !defined(TG_NO_SELFTEST)
 static int tg_mtproto_executable_sniff_self_test(void); /* defined by the download engine */
 static int tg_mtproto_photo_gate_self_test(void);       /* defined by the upload engine */
+static int tg_mtproto_sent_code_text_self_test(void);   /* defined with the login texts */
 #endif
 
 int tg_mtproto_probe_self_test(void)
@@ -14342,6 +14800,9 @@ int tg_mtproto_probe_self_test(void)
         return 2;
     }
     if (tg_mtproto_photo_gate_self_test() != 0) {
+        return 2;
+    }
+    if (tg_mtproto_sent_code_text_self_test() != 0) {
         return 2;
     }
     if (tg_gui_hidden_projection_self_test() != 0) {
@@ -15062,6 +15523,7 @@ int tg_gui_session_open(const char *api_file, const char *auth_file,
        the notify back-pointer and arm collection before anything can recv. */
     tg_chat_engine_init(&tg_gui_session_state.engine);
     tg_chat_nq = &tg_gui_session_state.engine.notify;
+    tg_chat_webpage_count = 0UL;
     tg_chat_notify_reset(&tg_gui_session_state.engine.notify, 1);
     /* Arm the live typing sink (the push collector writes it; the tick reads it)
        and turn ON the update push stream so "<name> is typing" arrives -- typing
@@ -15212,6 +15674,7 @@ int tg_gui_session_open_chat(unsigned long peer_index, FILE *stream)
         return 0;
     }
     tg_gui_log("open_chat: start");
+    tg_chat_webpage_count = 0UL;
     /* Do not finish an old chat's thumbnails after the user switched. Fresh
        history below repopulates the bounded queue with the visible chat. */
     tg_gui_photo_queue_reset();
@@ -16199,6 +16662,20 @@ int tg_gui_session_send(const char *text, unsigned long reply_to_msg_id,
                                            ->reply_snippet
                                      : 0,
                                  sent_id);
+        tg_gui_driver_set_pending_webpage(&tg_gui_session_state.gui_driver,
+                                          sent_id, tg_chat_sent_webpage.id_hi,
+                                          tg_chat_sent_webpage.id_lo);
+        if (!tg_chat_sent_webpage.pending) {
+            int ready = tg_gui_photo_cache_exists(
+                tg_chat_sent_webpage.photo.id_hi,
+                tg_chat_sent_webpage.photo.id_lo, 0);
+
+            if (tg_gui_driver_apply_webpage(&tg_gui_session_state.gui_driver,
+                                            &tg_chat_sent_webpage, ready) &&
+                tg_chat_sent_webpage.photo.has_photo) {
+                tg_gui_photo_catalog_offer(&tg_chat_sent_webpage.photo);
+            }
+        }
     }
     tg_net_set_connect_timeout_seconds(prev_timeout);
     tg_mtproto_close_quiet_stream(quiet, stream);
@@ -16294,6 +16771,8 @@ int tg_gui_session_edit(const char *text, unsigned long message_id, FILE *stream
         tg_gui_session_state.current_peer_index, message_id, edit_text, quiet);
     if (rc == 0) {
         /* Update the on-screen bubble at once with the ORIGINAL Latin-1 text. */
+        tg_gui_driver_set_pending_webpage(&tg_gui_session_state.gui_driver,
+                                          message_id, 0UL, 0UL);
         (void)tg_gui_driver_update_text(&tg_gui_session_state.gui_driver,
                                         message_id, text);
     }
@@ -16398,6 +16877,20 @@ int tg_gui_session_mention_candidates(const char *prefix, char *items,
         return 0; /* mentions only make sense in an open group */
     }
     tg_gui_session_ensure_members(stream);
+    /* Field diagnostic: "no popup after @" has three legitimate causes that
+       look identical from the keyboard. Say which one this is, once per
+       open group, when the debug log is on. */
+    if (tg_gui_log_is_enabled() &&
+        tg_gui_session_state.member_cache.count == 0) {
+#if defined(__MORPHOS__) || defined(__MORPHOS)
+        tg_gui_log("mention: no members (MorphOS skips the fetch by design)");
+#else
+        tg_gui_log(tg_gui_session_state.open_peer_constructor ==
+                           TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR
+                       ? "mention: no members (fetch returned none)"
+                       : "mention: no members (basic group, needs getFullChat)");
+#endif
+    }
     plen = (prefix != 0) ? (unsigned long)strlen(prefix) : 0UL;
     n = 0;
     for (i = 0UL;
@@ -17116,6 +17609,68 @@ static const char *tg_mtproto_upload_failure_text(const char *raw)
 /* Host-runnable: the gate says yes to a whole JPEG and a whole PNG, no to a
    truncated one of each, no to a PNG Telegram would refuse for its size, and
    no to plain text, each with the sentence a status line will show. */
+/* Every auth.SentCodeType Telegram documents must map to a sentence, and the
+   one that means "no code is coming" must not read like the others. Checked
+   against core.telegram.org/type/auth.SentCodeType (2026-09-10). */
+static int tg_mtproto_sent_code_text_self_test(void)
+{
+    static const unsigned long known[] = {
+        0x3dbb5986UL, /* app */
+        0xc000bba2UL, /* sms */
+        0x5353e5a7UL, /* call */
+        0xab03c6d9UL, /* flashCall */
+        0x82006484UL, /* missedCall */
+        0xf450f59bUL, /* emailCode */
+        0xa5491deaUL, /* setUpEmailRequired */
+        0xd9565c39UL, /* fragmentSms */
+        0x009fd736UL, /* firebaseSms */
+        0xa416ac81UL, /* smsWord */
+        0xb37794afUL  /* smsPhrase */
+    };
+    unsigned long i;
+
+    for (i = 0UL; i < sizeof(known) / sizeof(known[0]); ++i) {
+        if (tg_mtproto_sent_code_text(known[i], 0) == 0 ||
+            tg_mtproto_sent_code_text(known[i], 1) == 0) {
+            printf("mtproto self-test: no text for sent code type 0x%08lx\n",
+                   known[i]);
+            return 2;
+        }
+    }
+    {
+        static const unsigned long routes[] = {
+            0x72a3158cUL, 0x741cd3e3UL, 0x226ccefbUL, 0xd61ad6eeUL,
+            0x06ed998cUL
+        };
+
+        for (i = 0UL; i < sizeof(routes) / sizeof(routes[0]); ++i) {
+            if (tg_mtproto_code_route_text(routes[i]) == 0) {
+                printf("mtproto self-test: no route for code type 0x%08lx\n",
+                       routes[i]);
+                return 2;
+            }
+        }
+        if (tg_mtproto_code_route_text(0x12345678UL) != 0 ||
+            strcmp(tg_mtproto_code_route_text(0x72a3158cUL), "by SMS") != 0) {
+            puts("mtproto self-test: resend route texts");
+            return 2;
+        }
+    }
+    /* The email-required answer must not promise a code. */
+    if (strstr(tg_mtproto_sent_code_text(0xa5491deaUL, 0),
+               "No code is coming") == 0) {
+        puts("mtproto self-test: setUpEmailRequired still promises a code");
+        return 2;
+    }
+    /* An unknown type admits it, and leaves the console line to the caller. */
+    if (tg_mtproto_sent_code_text(0x12345678UL, 0) != 0 ||
+        strstr(tg_mtproto_sent_code_text(0x12345678UL, 1), "did not say") == 0) {
+        puts("mtproto self-test: unknown sent code type pretends to know");
+        return 2;
+    }
+    return 0;
+}
+
 static int tg_mtproto_photo_gate_self_test(void)
 {
     static const unsigned char jpeg_ok[] = {
@@ -17176,6 +17731,37 @@ static int tg_mtproto_photo_gate_self_test(void)
         puts("photo gate self-test: server refusal wording");
         return 2;
     }
+#if TG_MTPROTO_DISPLAY_LATIN1
+    /* 0.0.93: an emoji pair in composer text goes out as the codepoint's
+       UTF-8; a lone prefix byte stays the two byte Latin-1 form as before. */
+    {
+        char src[8];
+        char out[32];
+        unsigned long cp;
+        unsigned long need;
+
+        if (!tg_gui_emoji_encode(0UL, src)) {
+            return 2;
+        }
+        src[2] = '!'; src[3] = '\0';
+        cp = tg_emoji_sheet_codepoints[0];
+        need = cp >= 0x10000UL ? 4UL : 3UL;
+        if (!tg_mtproto_latin1_to_utf8(src, out, sizeof(out)) ||
+            strlen(out) != need + 1UL || out[need] != '!' ||
+            (need == 4UL && (unsigned char)out[0] != (0xf0U | (cp >> 18))) ||
+            (need == 3UL && (unsigned char)out[0] != (0xe0U | (cp >> 12))) ||
+            (unsigned char)out[need - 1UL] != (0x80U | (cp & 0x3fU))) {
+            puts("photo gate self-test: emoji pair did not expand to UTF-8");
+            return 2;
+        }
+        src[0] = (char)0x80; src[1] = '\0';
+        if (!tg_mtproto_latin1_to_utf8(src, out, sizeof(out)) ||
+            strlen(out) != 2UL || (unsigned char)out[0] != 0xc2U) {
+            puts("photo gate self-test: lone prefix changed meaning");
+            return 2;
+        }
+    }
+#endif
     return 0;
 }
 #endif
@@ -18960,6 +19546,67 @@ static const char *tg_gui_session_resolve_typing_member(FILE *stream)
     return 0;
 }
 
+static int tg_gui_session_apply_webpage_updates(void)
+{
+    unsigned long i;
+    int dirty = 0;
+
+    for (i = 0UL; i < tg_chat_webpage_count; ++i) {
+        tg_chat_webpage_entry *entry = &tg_chat_webpages[i];
+        int channel = entry->channel_hi != 0UL || entry->channel_lo != 0UL;
+        int open_channel = tg_gui_session_state.open_peer_constructor ==
+            TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR;
+        int ready;
+
+        if (tg_gui_session_state.current_peer_index[0] == '\0' ||
+            channel != open_channel ||
+            (channel && (entry->channel_hi != tg_gui_session_state.open_peer_id_hi ||
+                         entry->channel_lo != tg_gui_session_state.open_peer_id_lo))) {
+            continue;
+        }
+        ready = entry->page.photo.has_photo && tg_gui_photo_cache_exists(
+            entry->page.photo.id_hi, entry->page.photo.id_lo, 0);
+        if (tg_gui_driver_apply_webpage(&tg_gui_session_state.gui_driver,
+                                        &entry->page, ready)) {
+            if (entry->page.photo.has_photo) {
+                tg_gui_photo_catalog_offer(&entry->page.photo);
+            }
+            tg_gui_log("webpage: pending bubble completed");
+            dirty = 1;
+        }
+    }
+    tg_chat_webpage_count = 0UL;
+    return dirty;
+}
+
+#if !defined(TG_NO_SELFTEST) && !defined(TG_NO_GUI)
+int tg_mtproto_test_webpage_update(tg_gui_chat_driver *gui,
+                                   const unsigned char *body, unsigned long length,
+                                   unsigned long channel_hi, unsigned long channel_lo)
+{
+    tg_chat_notify notify;
+    tg_chat_notify *saved_notify = tg_chat_nq;
+    int dirty;
+
+    memset(&notify, 0, sizeof(notify));
+    notify.armed = 1;
+    tg_chat_nq = &notify;
+    tg_chat_webpage_count = 0UL;
+    tg_gui_session_state.gui_driver = *gui;
+    strcpy(tg_gui_session_state.current_peer_index, "self");
+    tg_gui_session_state.open_peer_constructor = channel_hi || channel_lo
+        ? TG_MTPROTO_PEER_CHANNEL_CONSTRUCTOR : TG_MTPROTO_PEER_SELF_CONSTRUCTOR;
+    tg_gui_session_state.open_peer_id_hi = channel_hi;
+    tg_gui_session_state.open_peer_id_lo = channel_lo;
+    tg_chat_notify_collect(body, length);
+    dirty = tg_gui_session_apply_webpage_updates();
+    tg_chat_nq = saved_notify;
+    tg_gui_session_state.gui_driver.state = 0;
+    tg_gui_session_state.current_peer_index[0] = '\0';
+    return dirty;
+}
+#endif
+
 static int tg_gui_session_apply_edit_updates(void)
 {
     unsigned long i;
@@ -18981,6 +19628,9 @@ static int tg_gui_session_apply_edit_updates(void)
             tg_gui_driver_update_text_utf8(
                 &tg_gui_session_state.gui_driver, entry->message_id,
                 entry->text)) {
+            tg_gui_driver_set_pending_webpage(&tg_gui_session_state.gui_driver,
+                entry->message_id, entry->pending_webpage_hi,
+                entry->pending_webpage_lo);
             dirty = 1;
         }
     }
@@ -19139,6 +19789,9 @@ static int tg_gui_session_apply_pushes(FILE *stream, int allow_member_fetch)
 
     dirty = 0;
     if (tg_gui_session_apply_edit_updates()) {
+        dirty = 1;
+    }
+    if (tg_gui_session_apply_webpage_updates()) {
         dirty = 1;
     }
     if (tg_gui_session_apply_read_update()) {
@@ -19453,6 +20106,19 @@ void tg_gui_session_login_begin(const char *api_file, const char *auth_file,
                       "data/phone-code-hash.txt");
 }
 
+/* The line that answers "where did the code go, and what comes next" from a
+   log the user can send us, instead of from a photograph of the window. */
+static void tg_gui_log_sent_code_route(void)
+{
+    char route[160];
+
+    sprintf(route, "login: sent code type 0x%08lx, %lu digits, "
+                   "next 0x%08lx, wait %lu s",
+            tg_mtproto_sent_code_type, tg_mtproto_sent_code_length(),
+            tg_mtproto_sent_code_next, tg_mtproto_sent_code_wait);
+    tg_gui_log(route);
+}
+
 int tg_gui_session_login_send_code(const char *phone, FILE *stream)
 {
     char api_id[32];
@@ -19520,6 +20186,7 @@ int tg_gui_session_login_send_code(const char *phone, FILE *stream)
         }
     }
     tg_gui_log("login: send_code done");
+    tg_gui_log_sent_code_route();
     if (rc != 0) {
         tg_mtproto_capture_quiet_error(
             quiet, stream, tg_gui_session_state.login.last_error,
@@ -19529,6 +20196,43 @@ int tg_gui_session_login_send_code(const char *phone, FILE *stream)
     tg_net_set_connect_timeout_seconds(prev_timeout);
     tg_mtproto_secure_zero(api_hash, sizeof(api_hash));
     return (rc == 0) ? TG_GUI_LOGIN_OK : TG_GUI_LOGIN_BAD_PHONE;
+}
+
+int tg_gui_session_login_resend_code(FILE *stream)
+{
+    unsigned long prev_timeout;
+    FILE *quiet;
+    int rc;
+
+    if (!tg_gui_session_state.login.active || stream == 0 ||
+        tg_gui_session_state.login.phone[0] == '\0' ||
+        tg_gui_session_state.login.api_id[0] == '\0') {
+        return TG_GUI_LOGIN_ERROR;
+    }
+    tg_gui_session_state.login.last_error[0] = '\0';
+    prev_timeout = tg_net_connect_timeout_seconds();
+    tg_net_set_connect_timeout_seconds(45UL);
+    /* Same quiet stream as send_code: no console output during network I/O
+       (the MorphOS freeze), and the refusal sentence is read back from it. */
+    quiet = tg_mtproto_open_quiet_stream(stream);
+    tg_gui_log("login: resend_code start");
+    rc = tg_mtproto_auth_resend_code(tg_gui_session_state.login.host, "443",
+                                     tg_gui_session_state.login.api_id,
+                                     tg_gui_session_state.login.auth_file,
+                                     tg_gui_session_state.login.phone,
+                                     tg_gui_session_state.login.code_hash_file,
+                                     tg_gui_session_state.login.dc_id_text,
+                                     quiet);
+    tg_gui_log(rc == 0 ? "login: resend_code done" : "login: resend_code FAIL");
+    tg_gui_log_sent_code_route();
+    if (rc != 0) {
+        tg_mtproto_capture_quiet_error(
+            quiet, stream, tg_gui_session_state.login.last_error,
+            sizeof(tg_gui_session_state.login.last_error));
+    }
+    tg_mtproto_close_quiet_stream(quiet, stream);
+    tg_net_set_connect_timeout_seconds(prev_timeout);
+    return (rc == 0) ? TG_GUI_LOGIN_OK : TG_GUI_LOGIN_ERROR;
 }
 
 int tg_gui_session_login_sign_in(const char *code, FILE *stream)

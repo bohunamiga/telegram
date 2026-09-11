@@ -8,6 +8,43 @@ unless noted.
 ## [Unreleased]
 
 ### Added
+- When the code Telegram delivers inside its app does not show up, the
+  login screen offers the other route Telegram proposes for it, usually
+  an SMS: press S once the wait it asks for has passed. The text client
+  takes S at its code prompt too. The route and the wait were already in
+  Telegram's answer and were being thrown away; the debug log now records
+  both next to the delivery type.
+- A paperclip at the left of the composer opens the attachment requester.
+  JPEG and PNG attachments offer Photo, File or Cancel, with the existing
+  caption dialog; other attachments follow the file upload path. It remains
+  available when emoji and inline photos are disabled.
+- "Settings > Enable emoji" switches the picker, composer button and graphical
+  emoji on or off. With it off, messages keep their text emoticons and the
+  composer keeps any emoji already entered. The choice is saved separately
+  from photos. Like inline photos, emoji start off on native AGA/ECS/OCS
+  screens or a 68k CPU below 68040; both need a 68040 or faster and an
+  RTG screen to start on. Explicit on/off choices override the defaults.
+- A link preview that Telegram finishes later appears in the open chat by
+  itself, including on a link just sent from this client. The title and
+  description update the existing message; its picture uses the same Inline
+  photos setting and bounded pipeline. The text client's cached transcript
+  gains the preview too.
+- Emoji can be sent. "Insert emoji..." in the Telegram menu (Amiga+E) opens a
+  panel above the composer: the recently used ones first, then the 109 emoji
+  this client already reads back as text emoticons, in a grid walked with the
+  arrow keys or clicked. ENTER inserts one at the caret and keeps the panel
+  open, ESC closes it, and the recent row survives between runs. Inside the
+  composer an emoji is drawn as a picture at least 16 pixels high, is
+  edited and stepped over as one character, and goes out as its real Unicode
+  codepoint. The pictures are Noto Emoji glyphs reduced to 16 pixels, shipped
+  under the SIL Open Font License; see third_party/noto-emoji. A smiley
+  button between the input and Send opens the same panel with the mouse,
+  centred vertically on the visible input box even with a small font.
+- Received emoji show as pictures too, the same ones the picker offers. Small
+  OS3 fonts such as Topaz 8 keep their size while the layout reserves a cell
+  of at least 16 pixels for a readable emoji, with matching row spacing and
+  caret positioning. Turning emoji off restores compact text rows and text
+  emoticons. Clipboard text keeps the emoticon representation.
 - A PNG goes out as a photo. The photo gate now reads the file's own bytes
   rather than its name: a JPEG is walked through its first scan as before, a
   PNG through its chunks to IEND, so a truncated file of either kind is
@@ -16,6 +53,51 @@ unless noted.
   for the same reason, and the server's own refusals now come back in words
   instead of an RPC name. The menu requester, the drop target and the text
   client's /photo all take .png alongside .jpg.
+
+### Fixed
+- A new login gets its code again. Telegram had stopped delivering the
+  in-app login code to this client: it accepted the request, said the code
+  was on its way inside the app, and nothing ever reached the phone, on more
+  than one account and with more than one api key. The connection now
+  declares its system language as a full locale, en-US, instead of a bare
+  en, the change other third-party clients found to bring the codes back;
+  on a number where two requests in half an hour had produced nothing, the
+  first one after it arrived. The same setting had worked since the first
+  release and nobody had reported a problem with it: what changed was how
+  Telegram treats it. Logins that were already saved were never affected.
+- The login screen no longer promises a code Telegram is not sending. One
+  delivery answer means "add and verify a login email first", and it used to
+  read like any other, so a first user waited for a message that could never
+  arrive. That case now says what the account needs, and a delivery type this
+  build does not recognise says so instead of pretending, with its number in
+  the console and in the debug log. The log also records the delivery route
+  and the digit count next to "send_code done", so a login that receives
+  nothing can be diagnosed from the log alone. The delivery line on the
+  code screen no longer cuts "phone" short.
+- Clicking URL text keeps the pointer aligned with literal characters such
+  as underscores and tildes, including below a link preview. Wrapped URLs
+  keep their complete text and link styling across lines. Clicking the
+  preview picture still opens the image viewer.
+- Opening a photo's context menu or the Send photo dialog no longer freezes
+  AfAOS while drawing its labels. Popup areas are copied from the completed
+  buffer after photo replay, so menus, mentions and emoji stay above pictures
+  during full repaints, refreshes and caret updates. The photo dialog also
+  uses the compatible bitmap text and matching caption/button metrics.
+- Toggling emoji no longer resizes avatars in the chat list or header.
+  The search field, chat rows and open-chat header keep their compact native
+  font dimensions too, with centred text and avatars, including initials.
+  Names and previews still fit graphical emoji; clicks, scrolling and row
+  reordering follow the same compact layout.
+- Composer text, caret and selection use the font's real baseline, correcting
+  the low text position with taller MorphOS fonts. The Send label stays
+  centred when the composer wraps onto several lines.
+- "Save photo as..." suggests .png for PNG bytes and .jpg for JPEG bytes,
+  regardless of the internal cache name. An uncached image is fetched before
+  the requester opens, then copied without conversion. Photos re-encoded by
+  Telegram keep the received format; sending as File preserves the original.
+- The automatic inline-photo default checks the screen's actual bitmap.
+  Having cybergraphics.library installed no longer makes an AGA/ECS/OCS
+  screen count as RTG. Emoji use the same check, including on classic OS4.
 
 ## [0.0.92] - 2026-09-04
 
@@ -48,6 +130,10 @@ unless noted.
   too, on the first-start page.
 
 ### Fixed
+- On MorphOS a photo no longer paints over a popup. The direct photo replay
+  writes into the window after the buffer is blitted, which put pictures on
+  top of the context menu, the mention list and the emoji panel; the popups
+  are now painted once more after the replay, straight onto the window.
 - A bubble no longer holds space open for a picture the client has given up
   on. Once every size of an image has been fetched and refused, which is what
   an undecodable format looks like from here, the message falls back to its

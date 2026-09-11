@@ -17,6 +17,7 @@
 #include "tg_gui.h"
 #include "tg_gui_session.h"
 #include "tg_avatar.h"
+#include "tg_emoji_sheet.h"
 #include "tg_mtproto_login.h"
 #include "tg_platform.h"
 #include "tg_version.h"
@@ -295,31 +296,43 @@ static void tg_gui_amiga_close_cybergraphics(void)
 }
 #endif
 
-/* Resolve the adaptive default only after Intuition has selected the actual
-   screen. An explicit saved choice never enters this path. The result stays in
-   memory for the whole run, including iconify/own-screen reopen cycles. */
-static void tg_gui_window_resolve_inline_default(tg_gui_state *state,
-                                                 struct Window *window)
+/* Resolve both adaptive defaults only after Intuition selected the screen.
+   A library installed on an AGA/ECS/OCS screen is not proof of RTG. */
+static void tg_gui_window_resolve_graphics_defaults(tg_gui_state *state,
+                                                    struct Window *window)
 {
-#if defined(__amigaos3__)
-    ULONG depth;
-    int cpu_at_least_040;
-    int has_rtg;
+    int classic_amiga = 0;
+    int cpu_at_least_040 = 1;
+    int has_rtg = 1;
+#if defined(__amigaos3__) || defined(__amigaos4__)
+    struct BitMap *bitmap;
+#endif
 
-    if (state == 0 || window == 0 || state->inline_photos_explicit ||
-        state->inline_photos_default_resolved) {
+    if (state == 0 || window == 0 ||
+        (state->inline_photos_default_resolved && state->emoji_default_resolved)) {
         return;
     }
-    depth = GetBitMapAttr(window->WScreen->RastPort.BitMap, BMA_DEPTH);
+#if defined(__amigaos3__) || defined(__amigaos4__)
+    classic_amiga = 1;
+    bitmap = window->WScreen->RastPort.BitMap;
+#if defined(__amigaos3__)
     cpu_at_least_040 =
         SysBase != 0 &&
         (SysBase->AttnFlags & (AFF_68040 | AFF_68060)) != 0;
-    has_rtg = depth > 8UL || tg_gui_amiga_open_cybergraphics();
-    state->inline_photos = tg_gui_inline_photos_resolve(
-        0, state->inline_photos, 1, cpu_at_least_040, has_rtg);
-    state->inline_photos_default_resolved = 1;
+#endif
+    /* OS4 can also run on a classic machine's AGA screen. Its PPC passes
+       the CPU threshold, but the actual screen still needs to be RTG. */
+    has_rtg = bitmap != 0 &&
+        (GetBitMapAttr(bitmap, BMA_DEPTH) > 8UL ||
+         (tg_gui_amiga_open_cybergraphics() &&
+          tg_gui_cgx_get_map_attr(bitmap, CYBRMATTR_ISCYBERGFX) != 0UL));
+    tg_gui_log(has_rtg ? "graphics: RTG screen" : "graphics: native screen");
+    tg_gui_log(cpu_at_least_040 ? "graphics: cpu >= 040" : "graphics: cpu < 040");
+#endif
+    tg_gui_graphics_preferences_resolve(state, classic_amiga,
+                                       cpu_at_least_040, has_rtg);
     tg_gui_session_set_inline_photos(state->inline_photos);
-    if (!state->inline_photos) {
+    if (!state->inline_photos_explicit && !state->inline_photos) {
         if (!has_rtg && !cpu_at_least_040) {
             tg_gui_log("photo: inline default off (no RTG / cpu < 040)");
         } else if (!has_rtg) {
@@ -328,10 +341,9 @@ static void tg_gui_window_resolve_inline_default(tg_gui_state *state,
             tg_gui_log("photo: inline default off (cpu < 040)");
         }
     }
-#else
-    (void)state;
-    (void)window;
-#endif
+    if (!state->emoji_explicit && !state->emoji_enabled) {
+        tg_gui_log("emoji: default off (native screen or cpu < 040)");
+    }
 }
 
 /* Core GUI libraries share the window lifetime. Keep the required
@@ -475,6 +487,8 @@ static int tg_gui_amiga_afa_text_compat(void)
 #define TG_MENU_CACHE_200 20
 #define TG_MENU_CACHE_UNLIMITED 21
 #define TG_MENU_CACHE_CLEAR 22
+#define TG_MENU_EMOJI 23
+#define TG_MENU_ENABLEEMOJI 24
 
 /* Dark-theme palette: one RGB triplet per pen role and per avatar tint. The
    backend resolves the renderer's pen indices to obtained pens here; a future
@@ -516,6 +530,7 @@ static const tg_gui_rgb tg_gui_avatar_rgb[TG_GUI_AVATAR_COLORS] = {
 };
 
 #define TG_GUI_PHOTO_DIRECT_OPS 24
+#define TG_GUI_POPUP_AREAS 3 /* context menu, mentions, emoji */
 
 struct tg_gui_photo_slot;
 
@@ -530,6 +545,7 @@ typedef struct tg_gui_photo_direct_op {
 
 typedef struct tg_gui_amiga_ctx {
     struct Window *window;
+    const tg_gui_state *state; /* live preference shared with viewer/popups */
     struct RastPort *rport;
     int origin_x;
     int origin_y;
@@ -547,7 +563,9 @@ typedef struct tg_gui_amiga_ctx {
     int buf_w;               /* allocated buffer width  (== inner_w when valid) */
     int buf_h;               /* allocated buffer height (== inner_h when valid) */
     int buf_ok;              /* 1 iff buf_bm and buf_rp.Font are valid */
-    int bitmap_text_compat;  /* AfA_OS Text() cannot target this off-screen RP */
+    tg_gui_rect popup_areas[TG_GUI_POPUP_AREAS];
+    int popup_count;         /* opaque regions composed into the current buffer */
+    int bitmap_text_compat;  /* bypass AfA Text() in buffers and client dialogs */
     int photo_truecolor;      /* optional cybergraphics RGB888 row replay */
     int photo_cgx_checked;    /* destination bitmap passed the RGB write/read test */
     int photo_cgx_usable;
@@ -579,9 +597,16 @@ static int tg_gui_amiga_line_height(tg_gui_backend *backend)
     return ((tg_gui_amiga_ctx *)backend->context)->line_h;
 }
 
-/* Baseline to top of the glyph cell, straight from the RastPort's font, so the
-   caret covers the letters instead of floating above them on systems whose
-   default font is taller than topaz 8. */
+static int tg_gui_amiga_font_height(tg_gui_backend *backend)
+{
+    const tg_gui_amiga_ctx *ctx = (const tg_gui_amiga_ctx *)backend->context;
+
+    return ctx != 0 && ctx->rport != 0 && ctx->rport->Font != 0
+               ? (int)ctx->rport->Font->tf_YSize : 8;
+}
+
+/* The font stays native; its baseline is centred in a taller layout cell
+   when small-font text shares a line with a graphical emoji. */
 static int tg_gui_amiga_font_ascent(tg_gui_backend *backend)
 {
     const tg_gui_amiga_ctx *ctx = (const tg_gui_amiga_ctx *)backend->context;
@@ -589,7 +614,9 @@ static int tg_gui_amiga_font_ascent(tg_gui_backend *backend)
     if (ctx == 0 || ctx->rport == 0 || ctx->rport->Font == 0) {
         return 0; /* renderer falls back to its own approximation */
     }
-    return (int)ctx->rport->Font->tf_Baseline;
+    return tg_gui_font_cell_ascent(ctx->state,
+                                   (int)ctx->rport->Font->tf_YSize,
+                                   (int)ctx->rport->Font->tf_Baseline);
 }
 
 static unsigned long tg_gui_amiga_font_char_index(const struct TextFont *font,
@@ -607,7 +634,7 @@ static unsigned long tg_gui_amiga_font_char_index(const struct TextFont *font,
    the native text engine's metrics, which can differ from the font-strike
    spacing used by our layerless-buffer fallback. Layout, click hit-testing and
    caret placement must use the exact same advance as the visible glyphs. */
-static int tg_gui_amiga_bitmap_text_width(const tg_gui_amiga_ctx *ctx,
+static int tg_gui_amiga_bitmap_text_width(const struct RastPort *rp,
                                           const char *text,
                                           unsigned long length)
 {
@@ -616,12 +643,11 @@ static int tg_gui_amiga_bitmap_text_width(const tg_gui_amiga_ctx *ctx,
     int width;
     int spacing;
 
-    font = ctx->buf_rp.Font != 0 ? ctx->buf_rp.Font : ctx->rport->Font;
+    font = rp->Font;
     if (font == 0) {
         return 0;
     }
-    spacing = ctx->buf_rp.Font != 0 ? (int)ctx->buf_rp.TxSpacing
-                                    : (int)ctx->rport->TxSpacing;
+    spacing = (int)rp->TxSpacing;
     width = 0;
     for (i = 0UL; i < length; ++i) {
         unsigned long index;
@@ -638,12 +664,10 @@ static int tg_gui_amiga_bitmap_text_width(const tg_gui_amiga_ctx *ctx,
     return width;
 }
 
-static int tg_gui_amiga_text_width(tg_gui_backend *backend, const char *text,
-                                   unsigned long length)
+/* Width of a plain run: TextLength, or the bitmap path on compat screens. */
+static int tg_gui_amiga_run_width(tg_gui_amiga_ctx *ctx, const char *text,
+                                  unsigned long length)
 {
-    tg_gui_amiga_ctx *ctx;
-
-    ctx = (tg_gui_amiga_ctx *)backend->context;
     if (length == 0UL) {
         return 0;
     }
@@ -651,9 +675,119 @@ static int tg_gui_amiga_text_width(tg_gui_backend *backend, const char *text,
         length = 0x7fffUL; /* TextLength count is 16-bit; clamp defensively */
     }
     if (ctx->bitmap_text_compat) {
-        return tg_gui_amiga_bitmap_text_width(ctx, text, length);
+        return tg_gui_amiga_bitmap_text_width(
+            ctx->buf_rp.Font != 0 ? &ctx->buf_rp : ctx->rport, text, length);
     }
     return (int)TextLength(ctx->rport, (STRPTR)text, (UWORD)length);
+}
+
+/* Width, paint and line metrics share a minimum readable emoji cell. Zero
+   selects text emoticons only when the feature is disabled. */
+static int tg_gui_amiga_emoji_cell(const tg_gui_amiga_ctx *ctx)
+{
+    int h = ctx->rport != 0 && ctx->rport->Font != 0
+                ? (int)ctx->rport->Font->tf_YSize : 8;
+
+    return tg_gui_emoji_inline_size(ctx->state, h);
+}
+
+/* Pens for the sheet palette, resolved once per session through the same
+   colour matching the avatars use. Entry 0 is never drawn (transparent). */
+static LONG tg_gui_av_pen_for(const unsigned char *rgb); /* defined with the avatars */
+static unsigned char tg_gui_emoji_pen[256];
+static int tg_gui_emoji_pen_ready;
+
+static void tg_gui_amiga_emoji_pens(void)
+{
+    int k;
+
+    if (tg_gui_emoji_pen_ready) {
+        return;
+    }
+    for (k = 0; k < 255; ++k) {
+        tg_gui_emoji_pen[k + 1] =
+            (unsigned char)tg_gui_av_pen_for(tg_emoji_sheet_palette[k]);
+    }
+    tg_gui_emoji_pen_ready = 1;
+}
+
+/* Draws sheet glyph `index` into the size x size square at (x, y_top), rows
+   of equal pens merged into one RectFill like the avatar painter, index 0
+   skipped so the background shows through. */
+static int tg_gui_amiga_glyph_image(tg_gui_backend *backend,
+                                    unsigned long index, int x, int y_top,
+                                    int size)
+{
+    tg_gui_amiga_ctx *ctx = (tg_gui_amiga_ctx *)backend->context;
+    const unsigned char *px;
+    int y;
+
+    if (ctx->state == 0 || !ctx->state->emoji_enabled ||
+        index >= tg_emoji_sheet_count || size <= 0 || ctx->rport == 0) {
+        return 0;
+    }
+    tg_gui_amiga_emoji_pens();
+    px = tg_emoji_sheet_pixels[index];
+    SetDrMd(ctx->rport, JAM1);
+    for (y = 0; y < size; ++y) {
+        int sy = (y * TG_EMOJI_GLYPH_SIZE) / size;
+        int xx = 0;
+
+        while (xx < size) {
+            int sx = (xx * TG_EMOJI_GLYPH_SIZE) / size;
+            unsigned char v = px[sy * TG_EMOJI_GLYPH_SIZE + sx];
+            int run = xx + 1;
+
+            if (v == 0U) {
+                ++xx;
+                continue;
+            }
+            while (run < size &&
+                   px[sy * TG_EMOJI_GLYPH_SIZE +
+                      ((run * TG_EMOJI_GLYPH_SIZE) / size)] == v) {
+                ++run;
+            }
+            SetAPen(ctx->rport, (LONG)tg_gui_emoji_pen[v]);
+            RectFill(ctx->rport, ctx->origin_x + x + xx,
+                     ctx->origin_y + y_top + y,
+                     ctx->origin_x + x + run - 1,
+                     ctx->origin_y + y_top + y);
+            xx = run;
+        }
+    }
+    return 1;
+}
+
+static int tg_gui_amiga_text_width(tg_gui_backend *backend, const char *text,
+                                   unsigned long length)
+{
+    tg_gui_amiga_ctx *ctx = (tg_gui_amiga_ctx *)backend->context;
+    unsigned long i = 0UL;
+    unsigned long run_start = 0UL;
+    unsigned long index;
+    int w = 0;
+    int cell = 0;
+
+    while (i < length) {
+        if (tg_gui_emoji_pair_at(text, length, i, &index)) {
+            if (cell == 0) {
+                cell = tg_gui_amiga_emoji_cell(ctx);
+            }
+            w += tg_gui_amiga_run_width(ctx, text + run_start, i - run_start);
+            if (cell > 0) {
+                w += cell;
+            } else {
+                const char *t = tg_gui_session_emoji_text(index);
+
+                w += tg_gui_amiga_run_width(ctx, t, (unsigned long)strlen(t));
+            }
+            i += 2UL;
+            run_start = i;
+        } else {
+            ++i;
+        }
+    }
+    return w + tg_gui_amiga_run_width(ctx, text + run_start, i - run_start);
 }
 
 static LONG tg_gui_amiga_resolve_pen(tg_gui_amiga_ctx *ctx, int pen)
@@ -1102,7 +1236,6 @@ typedef struct tg_gui_photo_save_job {
     int last_percent;
     unsigned long id_hi;
     unsigned long id_lo;
-    char destination[256];
 } tg_gui_photo_save_job;
 
 static tg_gui_photo_slot tg_gui_photo_slots[TG_GUI_PHOTO_SLOTS];
@@ -1247,6 +1380,12 @@ static void tg_gui_av_reset(void)
         tg_gui_av_slots[i].state = 0;
     }
     tg_gui_av_pool_n = 0;
+    /* The emoji palette is resolved through this same pool, so its pen
+       numbers die with it: after an iconify (or a screen switch) the pool
+       is released and refilled with different pens, and a cache kept alive
+       here drew every glyph in whatever colours those old numbers had come
+       to mean (field report, AROS x86_64 at 24 bits). */
+    tg_gui_emoji_pen_ready = 0;
     tg_gui_av_evict = 0UL;
     tg_gui_photo_slots_reset();
 }
@@ -3571,6 +3710,55 @@ static int tg_gui_photo_direct_queue(tg_gui_amiga_ctx *ctx,
 #endif
 }
 
+static void tg_gui_amiga_popup_area(tg_gui_backend *backend, tg_gui_rect rect)
+{
+    tg_gui_amiga_ctx *ctx = (tg_gui_amiga_ctx *)backend->context;
+
+    if (ctx->rport == &ctx->buf_rp && ctx->popup_count < TG_GUI_POPUP_AREAS) {
+        ctx->popup_areas[ctx->popup_count++] = rect;
+    }
+}
+
+/* Popup text and glyphs are already in the buffer. Copy their opaque regions
+   back after RGB photo replay; never call the text renderer under the layer
+   lock. That bypassed the AfA bitmap-text path and froze the whole system.
+   Restore whole popups: a photo intersecting a dirty strip may be replayed
+   beyond that strip. The caller owns the window/BeginRefresh layer lock. */
+#if defined(TG_GUI_HAVE_CYBERGRAPHICS)
+static void tg_gui_window_restore_popups(tg_gui_amiga_ctx *ctx)
+{
+    int i;
+
+    if (!ctx->buf_ok || ctx->buf_bm == 0 || ctx->popup_count <= 0 ||
+        ctx->buf_w != ctx->inner_w || ctx->buf_h != ctx->inner_h) {
+        return;
+    }
+    for (i = 0; i < ctx->popup_count; ++i) {
+        tg_gui_rect r = ctx->popup_areas[i];
+        int x1 = r.x + r.w;
+        int y1 = r.y + r.h;
+
+        if (r.x < 0) {
+            r.x = 0;
+        }
+        if (r.y < 0) {
+            r.y = 0;
+        }
+        if (x1 > ctx->buf_w) {
+            x1 = ctx->buf_w;
+        }
+        if (y1 > ctx->buf_h) {
+            y1 = ctx->buf_h;
+        }
+        if (x1 > r.x && y1 > r.y) {
+            BltBitMapRastPort(ctx->buf_bm, r.x, r.y, ctx->rport,
+                              ctx->origin_x + r.x, ctx->origin_y + r.y,
+                              x1 - r.x, y1 - r.y, 0xC0);
+        }
+    }
+}
+#endif
+
 /* A full off-screen paint records the RGB photo rectangles when its friend
    bitmap is not CGX. Replay only the rectangles touched by the following
    window blit; the layer/BeginRefresh lock is owned by the caller. */
@@ -3620,9 +3808,11 @@ static int tg_gui_photo_direct_replay(tg_gui_amiga_ctx *ctx,
                 slot->state = 2;
                 slot->render_logged = 0;
             }
+            tg_gui_window_restore_popups(ctx);
             return 0;
         }
     }
+    tg_gui_window_restore_popups(ctx);
     return 1;
 #else
     (void)ctx;
@@ -4112,13 +4302,11 @@ static void tg_gui_amiga_blt_text(struct RastPort *rp, int x, int baseline,
     Move(rp, (LONG)cursor, (LONG)baseline);
 }
 
-static void tg_gui_amiga_draw_text(tg_gui_backend *backend, int pen, int x,
-                                   int baseline, const char *text,
-                                   unsigned long length)
+/* One plain run of text at (x, baseline). */
+static void tg_gui_amiga_draw_run(tg_gui_amiga_ctx *ctx, int pen, int x,
+                                  int baseline, const char *text,
+                                  unsigned long length)
 {
-    tg_gui_amiga_ctx *ctx;
-
-    ctx = (tg_gui_amiga_ctx *)backend->context;
     if (length == 0UL) {
         return;
     }
@@ -4130,12 +4318,58 @@ static void tg_gui_amiga_draw_text(tg_gui_backend *backend, int pen, int x,
     SetAPen(ctx->rport, tg_gui_amiga_resolve_pen(ctx, pen));
     SetDrMd(ctx->rport, JAM1);
     Move(ctx->rport, ctx->origin_x + x, ctx->origin_y + baseline);
-    if (ctx->bitmap_text_compat && ctx->rport == &ctx->buf_rp) {
+    if (ctx->bitmap_text_compat) {
         tg_gui_amiga_blt_text(ctx->rport, ctx->origin_x + x,
                               ctx->origin_y + baseline, text, length);
     } else {
         Text(ctx->rport, (STRPTR)text, (UWORD)length);
     }
+}
+
+/* Text with emoji pairs: plain runs go through the font, each pair is a
+   glyph cell of the font height whose bottom sits on the descender line,
+   so a face lines up with the letters beside it. */
+static void tg_gui_amiga_draw_text(tg_gui_backend *backend, int pen, int x,
+                                   int baseline, const char *text,
+                                   unsigned long length)
+{
+    tg_gui_amiga_ctx *ctx = (tg_gui_amiga_ctx *)backend->context;
+    unsigned long i = 0UL;
+    unsigned long run_start = 0UL;
+    unsigned long index;
+    int cell = 0;
+
+    while (i < length) {
+        if (tg_gui_emoji_pair_at(text, length, i, &index)) {
+            int ascent;
+
+            if (cell == 0) {
+                cell = tg_gui_amiga_emoji_cell(ctx);
+            }
+            tg_gui_amiga_draw_run(ctx, pen, x, baseline, text + run_start,
+                                  i - run_start);
+            x += tg_gui_amiga_run_width(ctx, text + run_start, i - run_start);
+            if (cell > 0) {
+                ascent = tg_gui_amiga_font_ascent(backend);
+                tg_gui_amiga_glyph_image(backend, index, x,
+                                         baseline - ascent,
+                                         cell);
+                x += cell;
+            } else {
+                const char *t = tg_gui_session_emoji_text(index);
+                unsigned long tl = (unsigned long)strlen(t);
+
+                tg_gui_amiga_draw_run(ctx, pen, x, baseline, t, tl);
+                x += tg_gui_amiga_run_width(ctx, t, tl);
+            }
+            i += 2UL;
+            run_start = i;
+        } else {
+            ++i;
+        }
+    }
+    tg_gui_amiga_draw_run(ctx, pen, x, baseline, text + run_start,
+                          i - run_start);
 }
 
 /* Map the renderer's style bitmask to graphics.library soft styles. Bold and
@@ -4316,6 +4550,7 @@ static void tg_gui_amiga_buffer_free(tg_gui_amiga_ctx *ctx)
     ctx->buf_ok = 0;
     ctx->buf_w = 0;
     ctx->buf_h = 0;
+    ctx->popup_count = 0;
 }
 
 /* AfA_OS performs opaque resize by stretching the window's current pixels
@@ -4469,6 +4704,7 @@ static void tg_gui_window_paint(const tg_gui_state *state,
         c->rport = &c->buf_rp;
         c->origin_x = 0;
         c->origin_y = 0;
+        c->popup_count = 0;
         tg_gui_paint(state, backend);
         if (profile_paint) {
             tg_gui_profile_active = 0;
@@ -4586,6 +4822,11 @@ static void tg_gui_window_paint_caret(const tg_gui_state *state,
         c->rport = &c->buf_rp;
         c->origin_x = 0;
         c->origin_y = 0;
+        /* Search/login caret paints retain the rest of the buffer. Only the
+           composer painter rebuilds its popup areas along with the input. */
+        if (state->mode == TG_GUI_MODE_CHAT && !state->search_active) {
+            c->popup_count = 0;
+        }
         tg_gui_paint_caret(state, backend);
         c->rport = saved_rport;
         c->origin_x = saved_ox;
@@ -4597,7 +4838,8 @@ static void tg_gui_window_paint_caret(const tg_gui_state *state,
            copy for popups and other modes whose dirty geometry is wider. */
         if (c->bitmap_text_compat &&
             state->mode == TG_GUI_MODE_CHAT && !state->search_active &&
-            !state->mention_active && !state->ctx_visible) {
+            !state->mention_active && !state->ctx_visible &&
+            !state->emoji_active) {
             int input_h;
             int sidebar_w;
             int content_h;
@@ -4848,7 +5090,10 @@ static void tg_gui_window_login_code_prompt(tg_gui_state *state)
     /* The status line is short: keep the hint inside it and only add the
        digit count when there is room for it. */
     if (digits > 0UL && digits < 100UL) {
-        sprintf(line, "%.34s (%lu digits)", hint, digits);
+        /* 35, not 34: "Code sent in Telegram on your phone" is 35 characters
+           and the old limit showed it as "...your phon (5 digits)". With two
+           digits at most the line is 47 characters, inside the status. */
+        sprintf(line, "%.35s (%lu digits)", hint, digits);
     } else {
         sprintf(line, "%.46s", hint);
     }
@@ -4873,6 +5118,46 @@ static void tg_gui_window_login_key(tg_gui_state *state, UWORD code,
             state->input[n - 1UL] = '\0';
             tg_gui_window_paint(state, backend);
         }
+        return;
+    }
+    if (state->mode == TG_GUI_MODE_LOGIN_CODE &&
+        (code == 's' || code == 'S')) {
+        /* A code is digits only, so S is free: the in-app code never came,
+           ask Telegram for its next route (auth.resendCode), the "send it by
+           SMS" the official apps offer after a wait. */
+        const char *route = tg_mtproto_sent_code_next_route();
+        unsigned long wait = tg_mtproto_sent_code_resend_wait();
+        char line[TG_GUI_NAME_MAX];
+
+        if (route == 0) {
+            tg_gui_window_copy(state->status, sizeof(state->status),
+                               "Telegram offers no other way");
+        } else if (wait > 0UL) {
+            sprintf(line, "Wait %lu s, then press S again",
+                    wait > 9999UL ? 9999UL : wait);
+            tg_gui_window_copy(state->status, sizeof(state->status), line);
+        } else {
+            int rc;
+
+            tg_gui_window_copy(state->status, sizeof(state->status),
+                               "Asking Telegram to resend...");
+            state->cursor_on = 0;
+            tg_gui_window_paint(state, backend);
+            rc = tg_gui_session_login_resend_code(stdout);
+            state->input[0] = '\0';
+            if (rc == TG_GUI_LOGIN_OK) {
+                tg_gui_window_login_code_prompt(state); /* the new route */
+            } else {
+                const char *e = tg_gui_session_login_last_error();
+
+                tg_gui_window_copy(state->status, sizeof(state->status),
+                                   (e != 0 && e[0] != '\0')
+                                       ? e : "Resend failed - try again");
+            }
+        }
+        state->cursor_on = 1;
+        *caret_ticks = 0;
+        tg_gui_window_paint(state, backend);
         return;
     }
     if (code != 13 && code != 10) { /* a printable character */
@@ -5035,7 +5320,44 @@ static void tg_gui_clip_close(struct IOClipReq *io, struct MsgPort *port)
 }
 
 /* Writes `text` to clip unit 0 as FORM FTXT / CHRS. 1 = ok. */
+/* Pairs are a screen thing: the clipboard gets the text emoticon instead,
+   which is what any other Amiga program can show. */
+static void tg_gui_clip_expand_pairs(const char *src, char *dst,
+                                     unsigned long dst_size)
+{
+    unsigned long i = 0UL;
+    unsigned long o = 0UL;
+    unsigned long len = (unsigned long)strlen(src);
+    unsigned long index;
+
+    while (i < len && o + 1UL < dst_size) {
+        if (tg_gui_emoji_pair_at(src, len, i, &index)) {
+            const char *t = tg_gui_session_emoji_text(index);
+
+            while (*t != '\0' && o + 1UL < dst_size) {
+                dst[o++] = *t++;
+            }
+            i += 2UL;
+        } else {
+            dst[o++] = src[i++];
+        }
+    }
+    dst[o] = '\0';
+}
+
+static int tg_gui_clip_write_text_raw(const char *text);
 static int tg_gui_clip_write_text(const char *text)
+{
+    static char expanded[TG_GUI_MSG_TEXT_MAX + 64];
+
+    if (text == 0) {
+        return 0;
+    }
+    tg_gui_clip_expand_pairs(text, expanded, sizeof(expanded));
+    return tg_gui_clip_write_text_raw(expanded);
+}
+
+static int tg_gui_clip_write_text_raw(const char *text)
 {
     static unsigned char iff[TG_GUI_MSG_TEXT_MAX + 24];
     struct MsgPort *port;
@@ -5183,6 +5505,8 @@ static struct NewMenu tg_gui_newmenu[] = {
       (APTR)TG_MENU_SENDFILE },
     { NM_ITEM,  (STRPTR)"Send photo...", (STRPTR)"P", 0, 0,
       (APTR)TG_MENU_SENDPHOTO },
+    { NM_ITEM,  (STRPTR)"Insert emoji...", (STRPTR)"E", 0, 0,
+      (APTR)TG_MENU_EMOJI },
     { NM_ITEM,  NM_BARLABEL, 0, 0, 0, 0 },
     { NM_ITEM,  (STRPTR)"Quit", (STRPTR)"Q", 0, 0,
       (APTR)TG_MENU_QUIT },
@@ -5203,6 +5527,8 @@ static struct NewMenu tg_gui_newmenu[] = {
     { NM_ITEM,  NM_BARLABEL, 0, 0, 0, 0 },
     { NM_ITEM,  (STRPTR)"Show inline photos", 0, CHECKIT | MENUTOGGLE, 0,
       (APTR)TG_MENU_INLINEPHOTOS },
+    { NM_ITEM,  (STRPTR)"Enable emoji", 0, CHECKIT | MENUTOGGLE, 0,
+      (APTR)TG_MENU_ENABLEEMOJI },
     { NM_ITEM,  (STRPTR)"Photo dithering", 0, 0, 0, 0 },
     { NM_SUB,   (STRPTR)"Full", 0,
       CHECKIT | MENUTOGGLE, 0, (APTR)TG_MENU_DITHER_FULL },
@@ -5247,6 +5573,28 @@ static struct MenuItem *tg_gui_menu_find_userdata(struct Menu *menu, APTR data)
         }
     }
     return 0;
+}
+
+static void tg_gui_menu_set_emoji(struct Menu *menu, int enabled)
+{
+    struct MenuItem *item;
+
+    item = tg_gui_menu_find_userdata(menu, (APTR)TG_MENU_ENABLEEMOJI);
+    if (item != 0) {
+        if (enabled) {
+            item->Flags |= CHECKED;
+        } else {
+            item->Flags &= (UWORD)~CHECKED;
+        }
+    }
+    item = tg_gui_menu_find_userdata(menu, (APTR)TG_MENU_EMOJI);
+    if (item != 0) {
+        if (enabled) {
+            item->Flags |= ITEMENABLED;
+        } else {
+            item->Flags &= (UWORD)~ITEMENABLED;
+        }
+    }
 }
 
 static void tg_gui_menu_set_photo_dither(struct Menu *menu, int dither)
@@ -5535,7 +5883,24 @@ static void tg_gui_sendphoto_text(tg_gui_sendphoto_ui *ui, int pen, int x,
     SetBPen(rp, ui->main_ctx->pens[TG_GUI_PEN_WINDOW]);
     SetDrMd(rp, JAM1);
     Move(rp, ui->win->BorderLeft + x, ui->win->BorderTop + baseline);
-    Text(rp, (STRPTR)text, (UWORD)len);
+    if (ui->main_ctx->bitmap_text_compat) {
+        tg_gui_amiga_blt_text(rp, ui->win->BorderLeft + x,
+                              ui->win->BorderTop + baseline, text, len);
+    } else {
+        Text(rp, (STRPTR)text, (UWORD)len);
+    }
+}
+
+/* The caption, caret and button hit boxes must use the same font strike as
+   the compatible painter. AfA's native text path can freeze this dialog
+   too, even before the first upload part is sent. */
+static int tg_gui_sendphoto_text_width(tg_gui_sendphoto_ui *ui,
+                                       const char *text, unsigned long len)
+{
+    if (ui->main_ctx->bitmap_text_compat) {
+        return tg_gui_amiga_bitmap_text_width(ui->win->RPort, text, len);
+    }
+    return (int)TextLength(ui->win->RPort, (STRPTR)text, (UWORD)len);
 }
 
 static void tg_gui_sendphoto_box(tg_gui_sendphoto_ui *ui, int pen, int x,
@@ -5560,22 +5925,19 @@ static void tg_gui_sendphoto_caption_row(tg_gui_sendphoto_ui *ui)
     tg_gui_sendphoto_box(ui, TG_GUI_PEN_SURFACE, 8, ui->cap_y, box_w, lh + 6);
     start = 0UL;
     while (start < ui->caption_len &&
-           (int)TextLength(rp, (STRPTR)(ui->caption + start),
-                           (UWORD)(ui->caption_len - start)) > box_w - 14) {
+           tg_gui_sendphoto_text_width(ui, ui->caption + start,
+                                       ui->caption_len - start) > box_w - 14) {
         ++start; /* keep the END visible while typing */
     }
     ascent = (rp->Font != 0) ? (int)rp->Font->tf_Baseline : lh - 2;
     if (ui->caption_len > start) {
-        SetAPen(rp, ui->main_ctx->pens[TG_GUI_PEN_TEXT]);
-        SetDrMd(rp, JAM1);
-        Move(rp, ui->win->BorderLeft + 12,
-             ui->win->BorderTop + ui->cap_y + 3 + ascent);
-        Text(rp, (STRPTR)(ui->caption + start),
-             (UWORD)(ui->caption_len - start));
+        tg_gui_sendphoto_text(ui, TG_GUI_PEN_TEXT, 12,
+                              ui->cap_y + 3 + ascent, ui->caption + start,
+                              ui->caption_len - start);
     }
     if (ui->cursor_on) {
-        int cx = 12 + (int)TextLength(rp, (STRPTR)(ui->caption + start),
-                                      (UWORD)(ui->caption_len - start)) + 1;
+        int cx = 12 + tg_gui_sendphoto_text_width(
+                          ui, ui->caption + start, ui->caption_len - start) + 1;
 
         tg_gui_sendphoto_box(ui, TG_GUI_PEN_TEXT, cx, ui->cap_y + 3, 2, lh);
     }
@@ -5615,8 +5977,8 @@ static void tg_gui_sendphoto_paint(tg_gui_sendphoto_ui *ui)
         int x = ui->iw - 8;
 
         for (i = 2; i >= 0; --i) {
-            int tw = (int)TextLength(rp, (STRPTR)labels[i],
-                                     (UWORD)strlen(labels[i]));
+            int tw = tg_gui_sendphoto_text_width(
+                ui, labels[i], (unsigned long)strlen(labels[i]));
 
             ui->btn_w[i] = tw + 16;
             x -= ui->btn_w[i];
@@ -5632,12 +5994,10 @@ static void tg_gui_sendphoto_paint(tg_gui_sendphoto_ui *ui)
 
             tg_gui_sendphoto_box(ui, fill, ui->btn_x[i], ui->btn_y,
                                  ui->btn_w[i], lh + 8);
-            SetAPen(rp, ui->main_ctx->pens[ink]);
-            SetDrMd(rp, JAM1);
-            Move(rp, ui->win->BorderLeft + ui->btn_x[i] + 8 +
-                     ((ui->btn_w[i] - 16 - tw) / 2),
-                 ui->win->BorderTop + ui->btn_y + 4 + ascent);
-            Text(rp, (STRPTR)labels[i], (UWORD)strlen(labels[i]));
+            tg_gui_sendphoto_text(ui, ink, ui->btn_x[i] + 8 +
+                                   ((ui->btn_w[i] - 16 - tw) / 2),
+                                  ui->btn_y + 4 + ascent, labels[i],
+                                  (unsigned long)strlen(labels[i]));
         }
     }
 }
@@ -6104,7 +6464,7 @@ static int tg_gui_photo_file_exists(const char *path)
     return 1;
 }
 
-static int tg_gui_photo_cached_jpeg(char *path, unsigned long path_size,
+static int tg_gui_photo_cached_image(char *path, unsigned long path_size,
                                     unsigned long id_hi,
                                     unsigned long id_lo, int large_only)
 {
@@ -6146,11 +6506,11 @@ static int tg_gui_photo_copy_atomic(const char *source,
         return 0;
     }
     destination_len = (unsigned long)strlen(destination);
-    if (destination_len + 6UL >= sizeof(part)) {
+    if (destination_len > 255UL) {
         return 1;
     }
-    sprintf(part, "%s.part", destination);
-    sprintf(backup, "%s.bak", destination);
+    sprintf(part, "%.255s.part", destination);
+    sprintf(backup, "%.255s.bak", destination);
     in = fopen(source, "rb");
     if (in == 0) {
         return 1;
@@ -6211,10 +6571,11 @@ static int tg_gui_photo_copy_atomic(const char *source,
     return 0;
 }
 
-/* 1 selected, 0 cancelled, -1 requester/path failure. */
+/* 1 selected, 0 cancelled, -1 requester/path failure, -2 unknown format. */
 static int tg_gui_photo_pick_destination(struct Window *win,
                                          unsigned long id_hi,
                                          unsigned long id_lo,
+                                         const char *source,
                                          char *destination,
                                          unsigned long destination_size)
 {
@@ -6224,8 +6585,9 @@ static int tg_gui_photo_pick_destination(struct Window *win,
     int result;
 
     destination[0] = '\0';
-    if (tg_gui_photo_default_filename(name, sizeof(name), id_hi, id_lo) != 0) {
-        return -1;
+    if (tg_gui_photo_default_filename(name, sizeof(name), id_hi, id_lo,
+                                      source) != 0) {
+        return -2;
     }
     AslBase = OpenLibrary((CONST_STRPTR)"asl.library", 38L);
     if (AslBase == 0) {
@@ -6244,8 +6606,7 @@ static int tg_gui_photo_pick_destination(struct Window *win,
         TG_GUI_TAG("Save photo as"), ASLFR_DoSaveMode, TRUE,
         ASLFR_InitialDrawer, TG_GUI_TAG(tg_gui_session_download_dir()),
         ASLFR_InitialFile, TG_GUI_TAG(name),
-        /* Same visible pattern as the send side (issue #13): what lands here
-           is a JPEG, so the drawer listing shows the photos already saved. */
+        /* List both supported formats; the suggestion follows the bytes. */
         ASLFR_DoPatterns, TRUE,
         ASLFR_InitialPattern, TG_GUI_TAG("#?.(jpg|jpeg|png)"), TAG_DONE);
     selected = req != 0 && AslRequestTags(req, TAG_DONE);
@@ -6285,6 +6646,35 @@ static void tg_gui_photo_save_status(tg_gui_state *state,
     tg_gui_window_paint(state, backend);
 }
 
+/* The image must be present before opening ASL so an uncached PNG gets the
+   same correct extension as a cached one. Copy it unchanged in either case. */
+static void tg_gui_photo_save_ready(tg_gui_state *state,
+                                    struct Window *win,
+                                    tg_gui_backend *backend,
+                                    const char *source,
+                                    unsigned long id_hi,
+                                    unsigned long id_lo)
+{
+    char destination[256];
+    char line[192];
+    int picked;
+
+    picked = tg_gui_photo_pick_destination(
+        win, id_hi, id_lo, source, destination, sizeof(destination));
+    if (picked == 0) {
+        strcpy(line, "Photo save cancelled");
+    } else if (picked == -2) {
+        strcpy(line, "Could not read that photo's format");
+    } else if (picked < 0) {
+        strcpy(line, "Could not open the save requester");
+    } else if (tg_gui_photo_copy_atomic(source, destination) == 0) {
+        sprintf(line, "Saved: %.180s", destination);
+    } else {
+        strcpy(line, "Could not save that photo");
+    }
+    tg_gui_photo_save_status(state, backend, line);
+}
+
 static void tg_gui_photo_save_begin(tg_gui_state *state,
                                     struct Window *win,
                                     tg_gui_backend *backend,
@@ -6293,8 +6683,6 @@ static void tg_gui_photo_save_begin(tg_gui_state *state,
                                     unsigned long id_lo)
 {
     char source[64];
-    char line[192];
-    int picked;
 
     if (job->pending) {
         tg_gui_photo_save_status(state, backend,
@@ -6306,23 +6694,8 @@ static void tg_gui_photo_save_begin(tg_gui_state *state,
                                  "A transfer is already running");
         return;
     }
-    picked = tg_gui_photo_pick_destination(
-        win, id_hi, id_lo, job->destination, sizeof(job->destination));
-    if (picked == 0) {
-        return;
-    }
-    if (picked < 0) {
-        tg_gui_photo_save_status(state, backend,
-                                 "Could not open the save requester");
-        return;
-    }
-    if (tg_gui_photo_cached_jpeg(source, sizeof(source), id_hi, id_lo, 0)) {
-        if (tg_gui_photo_copy_atomic(source, job->destination) == 0) {
-            sprintf(line, "Saved: %.180s", job->destination);
-        } else {
-            strcpy(line, "Could not save that photo");
-        }
-        tg_gui_photo_save_status(state, backend, line);
+    if (tg_gui_photo_cached_image(source, sizeof(source), id_hi, id_lo, 0)) {
+        tg_gui_photo_save_ready(state, win, backend, source, id_hi, id_lo);
         return;
     }
     if (tg_gui_session_request_photo_jpeg(id_hi, id_lo, 1) == 0) {
@@ -6339,6 +6712,7 @@ static void tg_gui_photo_save_begin(tg_gui_state *state,
 }
 
 static int tg_gui_photo_save_tick(tg_gui_state *state,
+                                  struct Window *win,
                                   tg_gui_backend *backend,
                                   tg_gui_photo_save_job *job)
 {
@@ -6352,15 +6726,11 @@ static int tg_gui_photo_save_tick(tg_gui_state *state,
     if (!job->pending) {
         return 0;
     }
-    if (tg_gui_photo_cached_jpeg(source, sizeof(source), job->id_hi,
+    if (tg_gui_photo_cached_image(source, sizeof(source), job->id_hi,
                                  job->id_lo, 1)) {
-        if (tg_gui_photo_copy_atomic(source, job->destination) == 0) {
-            sprintf(line, "Saved: %.180s", job->destination);
-        } else {
-            strcpy(line, "Could not save that photo");
-        }
+        tg_gui_photo_save_ready(state, win, backend, source, job->id_hi,
+                                job->id_lo);
         memset(job, 0, sizeof(*job));
-        tg_gui_photo_save_status(state, backend, line);
         return 1;
     }
     pending = tg_gui_session_request_photo_jpeg(job->id_hi, job->id_lo, 1);
@@ -6402,42 +6772,6 @@ static void tg_gui_photo_save_cancel(tg_gui_state *state,
     tg_gui_photo_save_status(state, backend, "Photo save cancelled");
 }
 
-static int tg_gui_window_path_is_jpeg(const char *path)
-{
-    const char *dot;
-    const char *p;
-    char ext[6];
-    int n;
-
-    if (path == 0) {
-        return 0;
-    }
-    dot = 0;
-    for (p = path; *p != '\0'; ++p) {
-        if (*p == '/' || *p == ':') {
-            dot = 0;
-        } else if (*p == '.') {
-            dot = p;
-        }
-    }
-    if (dot == 0) {
-        return 0;
-    }
-    n = 0;
-    while (dot[n] != '\0' && n < 5) {
-        char c;
-
-        c = dot[n];
-        if (c >= 'A' && c <= 'Z') {
-            c = (char)(c - 'A' + 'a');
-        }
-        ext[n++] = c;
-    }
-    ext[n] = '\0';
-    return strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0 ||
-           strcmp(ext, ".png") == 0;
-}
-
 /* ASL file requester -> non-blocking upload on the open chat.
    The requester is synchronous and system-rendered (safe while we are the
    caller); the upload is only ARMED here -- the event loop pumps it one part
@@ -6445,11 +6779,12 @@ static int tg_gui_window_path_is_jpeg(const char *path)
 static void tg_gui_window_send_file_mode(tg_gui_state *state,
                                          struct Window *win,
                                          tg_gui_backend *backend,
-                                         int as_photo)
+                                         int mode) /* 0 file, 1 photo, 2 paperclip */
 {
     struct FileRequester *req;
     char path[256];
     int rc;
+    int as_photo = mode == 1;
 
     if (state->mode != TG_GUI_MODE_CHAT || !tg_gui_session_is_open() ||
         state->chat_count <= 0) {
@@ -6488,7 +6823,8 @@ static void tg_gui_window_send_file_mode(tg_gui_state *state,
     } else {
         req = (struct FileRequester *)AllocAslRequestTags(
             ASL_FileRequest, ASLFR_Window, (unsigned long)win,
-            ASLFR_TitleText, (unsigned long)"Send file to this chat",
+            ASLFR_TitleText, TG_GUI_TAG(mode == 2 ? "Attach to this chat"
+                                                   : "Send file to this chat"),
             TAG_DONE);
     }
     path[0] = '\0';
@@ -6522,6 +6858,9 @@ static void tg_gui_window_send_file_mode(tg_gui_state *state,
     AslBase = 0;
     if (path[0] == '\0') {
         return; /* cancelled */
+    }
+    if (mode == 2) {
+        as_photo = tg_gui_attachment_is_photo(path);
     }
     if (as_photo) {
         char dcaption[512];
@@ -7464,6 +7803,7 @@ static int tg_gui_photo_viewer_open_window(tg_gui_photo_viewer *viewer,
         SetFont(viewer->ctx.rport, main_ctx->rport->Font);
     }
     viewer->ctx.line_h = main_ctx->line_h;
+    viewer->ctx.state = main_ctx->state;
     memcpy(viewer->ctx.pens, main_ctx->pens, sizeof(viewer->ctx.pens));
     memcpy(viewer->ctx.avatar_pens, main_ctx->avatar_pens,
            sizeof(viewer->ctx.avatar_pens));
@@ -7890,6 +8230,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
     }
 
     memset(&ctx, 0, sizeof(ctx));
+    ctx.state = state;
     memset(&viewer, 0, sizeof(viewer));
     memset(&photo_save, 0, sizeof(photo_save));
     ctx.photo_dither = state->photo_dither;
@@ -8057,7 +8398,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
     }
 
     ctx.rport = ctx.window->RPort;
-    tg_gui_window_resolve_inline_default(state, ctx.window);
+    tg_gui_window_resolve_graphics_defaults(state, ctx.window);
     if (own_scr != 0 && own_scr->RastPort.Font != 0) {
         /* SA_SysFont sets the SCREEN font, but a window RastPort still comes up
            with the fixed-width DefaultFont (autodoc caveat) -- adopt the screen
@@ -8065,7 +8406,8 @@ static int tg_gui_run_window_once(tg_gui_state *state)
         SetFont(ctx.rport, own_scr->RastPort.Font);
     }
     font = ctx.rport->Font;
-    ctx.line_h = (font != 0 ? (int)font->tf_YSize : 8) + 2;
+    ctx.line_h = tg_gui_font_line_height(state,
+                                         font != 0 ? (int)font->tf_YSize : 8);
     ctx.bitmap_text_compat = tg_gui_amiga_afa_text_compat();
     if (ctx.bitmap_text_compat) {
         tg_gui_log("window: AfA bitmap-text compatibility active");
@@ -8132,6 +8474,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     }
                 }
                 tg_gui_menu_set_photo_dither(menu, state->photo_dither);
+                tg_gui_menu_set_emoji(menu, state->emoji_enabled);
                 tg_gui_menu_set_photo_cache_limit(
                     menu, state->photo_cache_limit_mb);
                 SetMenuStrip(ctx.window, menu);
@@ -8145,14 +8488,17 @@ static int tg_gui_run_window_once(tg_gui_state *state)
     backend.height = tg_gui_amiga_height;
     backend.line_height = tg_gui_amiga_line_height;
     backend.font_ascent = tg_gui_amiga_font_ascent;
+    backend.font_height = tg_gui_amiga_font_height;
     backend.text_width = tg_gui_amiga_text_width;
     backend.fill_rect = tg_gui_amiga_fill_rect;
     backend.avatar_fill = tg_gui_amiga_avatar_fill;
     backend.avatar_image = tg_gui_amiga_avatar_image;
+    backend.glyph_image = tg_gui_amiga_glyph_image;
     backend.photo_image = tg_gui_amiga_photo_image;
     backend.draw_text = tg_gui_amiga_draw_text;
     backend.set_style = tg_gui_amiga_set_style;
     backend.fill_pill = tg_gui_amiga_fill_pill;
+    backend.popup_area = tg_gui_amiga_popup_area;
     backend.round_bg = TG_GUI_PEN_WINDOW;
 
     mem_after = (unsigned long)AvailMem(MEMF_ANY);
@@ -8434,6 +8780,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                 case 'R': key_menu_action = (APTR)TG_MENU_REMOVE; break;
                 case 'F': key_menu_action = (APTR)TG_MENU_SENDFILE; break;
                 case 'P': key_menu_action = (APTR)TG_MENU_SENDPHOTO; break;
+                case 'E': key_menu_action = (APTR)TG_MENU_EMOJI; break;
                 case 'I': key_menu_action = (APTR)TG_MENU_ICONIFY; break;
                 case 'Q': key_menu_action = (APTR)TG_MENU_QUIT; break;
                 default: break; /* unknown shortcut: swallowed, never typed */
@@ -8635,7 +8982,19 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                    cancels, BACKSPACE deletes. While the '@' mention popup is
                    up, RETURN/TAB insert the highlighted username instead (the
                    NEXT return sends) and ESC only closes the popup. */
-                if ((msg_code == 13 || msg_code == 10 || msg_code == 9) &&
+                if (state->emoji_active &&
+                    (msg_code == 13 || msg_code == 10 || msg_code == 27)) {
+                    /* The emoji picker owns ENTER and ESC while it is up:
+                       ENTER inserts and keeps the panel open for the next
+                       one, ESC closes it. The arrows are raw keys and are
+                       taken in the raw key chain below. */
+                    if (msg_code == 27) {
+                        tg_gui_emoji_close(state);
+                    } else {
+                        (void)tg_gui_emoji_pick(state);
+                    }
+                    tg_gui_window_paint(state, &backend);
+                } else if ((msg_code == 13 || msg_code == 10 || msg_code == 9) &&
                     state->mention_active) {
                     tg_gui_window_mention_complete(state);
                     tg_gui_window_paint(state, &backend);
@@ -8706,10 +9065,17 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                         c = n;
                     }
                     if (c > 0UL) {
-                        /* delete the char before the caret, keeping the NUL */
-                        memmove(&state->input[c - 1UL], &state->input[c],
+                        /* delete the unit before the caret, keeping the NUL:
+                           one byte, or the two of an emoji pair */
+                        unsigned long del = 1UL;
+
+                        if (c >= 2UL &&
+                            tg_gui_emoji_pair_at(state->input, n, c - 2UL, 0)) {
+                            del = 2UL;
+                        }
+                        memmove(&state->input[c - del], &state->input[c],
                                 n - c + 1UL);
-                        state->input_caret = (int)(c - 1UL);
+                        state->input_caret = (int)(c - del);
                         tg_gui_window_mention_refresh(state);
                         tg_gui_window_paint_composer_edit(
                             state, &backend, old_input_h, old_mention_active);
@@ -8730,8 +9096,13 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                         /* forward-delete: pull the tail (incl. NUL) one left,
                            the caret stays put. Backspace (0x08) deletes left;
                            this splits the two so Canc is not folded into it. */
-                        memmove(&state->input[c], &state->input[c + 1UL],
-                                n - c);
+                        {
+                            unsigned long unit =
+                                tg_gui_text_unit_len(state->input, n, c);
+
+                            memmove(&state->input[c], &state->input[c + unit],
+                                    n - (c + unit) + 1UL); /* tail + NUL */
+                        }
                         tg_gui_window_mention_refresh(state);
                         tg_gui_window_paint_composer_edit(
                             state, &backend, old_input_h, old_mention_active);
@@ -8870,6 +9241,14 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                                 : 0;
                     }
                     tg_gui_window_paint_caret(state, &backend);
+                } else if (state->emoji_active &&
+                           (msg_code == 0x4C || msg_code == 0x4D ||
+                            msg_code == 0x4E || msg_code == 0x4F)) {
+                    /* The emoji panel walks its grid with the arrows. */
+                    tg_gui_emoji_move(state,
+                                      msg_code == 0x4F ? -1 : msg_code == 0x4E ? 1 : 0,
+                                      msg_code == 0x4C ? -1 : msg_code == 0x4D ? 1 : 0);
+                    tg_gui_window_paint(state, &backend);
                 } else if (msg_code == 0x4F || msg_code == 0x4E) {
                     /* cursor left/right; with SHIFT they grow/shrink the
                        composer selection anchored where Shift was first
@@ -8888,11 +9267,20 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     }
                     if (msg_code == 0x4F && state->input_caret > 0) {
                         state->input_caret--;
+                        if (state->input_caret > 0 &&
+                            tg_gui_emoji_pair_at(state->input,
+                                                 strlen(state->input),
+                                                 (unsigned long)state->input_caret - 1UL, 0)) {
+                            state->input_caret--; /* over the whole pair */
+                        }
                         changed = 1;
                     } else if (msg_code == 0x4E &&
                                state->input_caret <
                                    (int)strlen(state->input)) {
-                        state->input_caret++;
+                        state->input_caret +=
+                            (int)tg_gui_text_unit_len(state->input,
+                                                      strlen(state->input),
+                                                      (unsigned long)state->input_caret);
                         changed = 1;
                     }
                     if (shifted &&
@@ -9020,6 +9408,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                 mnum = msg_code;
                 for (;;) {
                     struct MenuItem *item = 0;
+                    UWORD next_mnum = MENUNULL;
 
                     {
                         APTR ud;
@@ -9036,6 +9425,8 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                             if (item == 0) {
                                 break;
                             }
+                            /* Settings can detach/reset the strip below. */
+                            next_mnum = item->NextSelect;
                             ud = GTMENUITEM_USERDATA(item);
                         }
                         if (ud == (APTR)TG_MENU_ABOUT) {
@@ -9051,6 +9442,13 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                         } else if (ud == (APTR)TG_MENU_SENDFILE) {
                             tg_gui_window_send_file(state, ctx.window,
                                                     &backend);
+                        } else if (ud == (APTR)TG_MENU_EMOJI) {
+                            if (state->emoji_active) {
+                                tg_gui_emoji_close(state);
+                            } else {
+                                tg_gui_emoji_open(state);
+                            }
+                            tg_gui_window_paint(state, &backend);
                         } else if (ud == (APTR)TG_MENU_SENDPHOTO) {
                             tg_gui_window_send_photo(state, ctx.window,
                                                      &backend);
@@ -9311,6 +9709,31 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                         } else if (ud == (APTR)TG_MENU_DLDIR) {
                             tg_gui_window_pick_download_dir(state, ctx.window,
                                                             &backend);
+                        } else if (ud == (APTR)TG_MENU_ENABLEEMOJI) {
+                            tg_gui_set_emoji_enabled(state, !state->emoji_enabled);
+                            ctx.line_h = tg_gui_font_line_height(
+                                state, ctx.rport->Font != 0
+                                           ? (int)ctx.rport->Font->tf_YSize : 8);
+                            viewer.ctx.line_h = ctx.line_h;
+                            if (menu != 0) {
+                                ClearMenuStrip(ctx.window);
+                                tg_gui_menu_set_emoji(menu, state->emoji_enabled);
+                                SetMenuStrip(ctx.window, menu);
+                            }
+                            if (tg_gui_emoji_preferences_save(
+                                    "data/telegram-emoji.txt",
+                                    state->emoji_enabled) != 0) {
+                                tg_gui_window_copy(state->status,
+                                                   sizeof(state->status),
+                                                   "Could not save emoji setting");
+                            } else {
+                                tg_gui_window_copy(state->status,
+                                                   sizeof(state->status),
+                                                   state->emoji_enabled
+                                                       ? "Emoji enabled"
+                                                       : "Emoji disabled");
+                            }
+                            tg_gui_window_paint(state, &backend);
                         } else if (ud == (APTR)TG_MENU_INLINEPHOTOS) {
                             state->inline_photos = !state->inline_photos;
                             state->inline_photos_explicit = 1;
@@ -9470,7 +9893,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     if (item == 0) {
                         break; /* keyboard path: a single action */
                     }
-                    mnum = item->NextSelect;
+                    mnum = next_mnum;
                 }
             } else if (msg_class == IDCMP_NEWSIZE) {
                 int first_resize;
@@ -10054,6 +10477,49 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                     picked_secs = 0UL;
                     hit = tg_gui_hit_test(state, ctx.inner_w, ctx.inner_h,
                                           ctx.line_h, hx, hy);
+                    /* The emoji panel and its button come first: the cell ids
+                       are positive and would otherwise read as chat rows (the
+                       0.0.93 field round: the smiley and the cells answered
+                       only the right button, this code sat in the MENUDOWN
+                       branch). */
+                    if (hit >= TG_GUI_HIT_EMOJI_BASE) {
+                        /* A cell of the panel: insert that glyph and keep
+                           the panel open for the next one. */
+                        state->emoji_sel = hit - TG_GUI_HIT_EMOJI_BASE;
+                        (void)tg_gui_emoji_pick(state);
+                        last_key_time = time(0);
+                        state->cursor_on = 1;
+                        caret_ticks = 0;
+                        tg_gui_window_paint(state, &backend);
+                        continue;
+                    } else if (hit == TG_GUI_HIT_EMOJI_BUTTON) {
+                        /* The smiley between the input and Send toggles the
+                           panel; opening it focuses the composer. */
+                        if (state->emoji_active) {
+                            tg_gui_emoji_close(state);
+                        } else {
+                            tg_gui_emoji_open(state);
+                            state->search_active = 0;
+                            state->in_sel_active = 0;
+                        }
+                        last_key_time = time(0);
+                        state->cursor_on = 1;
+                        caret_ticks = 0;
+                        tg_gui_window_paint(state, &backend);
+                        continue;
+                    } else if (hit == TG_GUI_HIT_ATTACH_BUTTON) {
+                        tg_gui_emoji_close(state);
+                        state->mention_active = 0;
+                        tg_gui_window_send_file_mode(state, ctx.window,
+                                                      &backend, 2);
+                        tg_gui_window_paint(state, &backend);
+                        continue;
+                    } else if (state->emoji_active &&
+                               hit != TG_GUI_HIT_INPUT) {
+                        /* Any other press puts the panel away and then acts
+                           as usual (a caret click keeps it). */
+                        tg_gui_emoji_close(state);
+                    }
                     if (hit <= TG_GUI_HIT_PHOTO_BASE) {
                         int mi = TG_GUI_HIT_PHOTO_BASE - hit;
 
@@ -10417,7 +10883,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                        painter redraws the insertion line. Gated on drag_src>=0 so
                        idle pointer motion (REPORTMOUSE is on) never reorders. */
                     int hy = (int)mouse_y - ctx.origin_y;
-                    int thresh = ((2 * ctx.line_h) + 12) / 2;
+                    int thresh = tg_gui_navigation_line_height(state, ctx.line_h) + 6;
 
                     state->drag_cur_y = hy;
                     if (!state->drag_active) {
@@ -10495,7 +10961,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
                             dname = dp + 1;
                         }
                     }
-                    if (tg_gui_window_path_is_jpeg(dropped)) {
+                    if (tg_gui_attachment_is_photo(dropped)) {
                         char dropcap[512];
 
                         jpeg_mode = tg_gui_window_send_photo_dialog(
@@ -10725,7 +11191,7 @@ static int tg_gui_run_window_once(tg_gui_state *state)
             session_dirty = 1;
             viewer_dirty = 1;
         }
-        if (tg_gui_photo_save_tick(state, &backend, &photo_save)) {
+        if (tg_gui_photo_save_tick(state, ctx.window, &backend, &photo_save)) {
             session_dirty = 1;
         }
         /* Decode only on a permitted background turn. The budget begins at the
@@ -11102,6 +11568,9 @@ int tg_gui_run_window(tg_gui_state *state)
     if (state == 0) {
         return 2;
     }
+    tg_gui_emoji_preferences_load("data/telegram-emoji.txt",
+                                  &state->emoji_enabled, &state->emoji_explicit);
+    state->emoji_default_resolved = 0;
     if (state->photo_cache_limit_mb != TG_GUI_PHOTO_CACHE_UNLIMITED_MB &&
         state->photo_cache_limit_mb != 10UL &&
         state->photo_cache_limit_mb != 50UL &&

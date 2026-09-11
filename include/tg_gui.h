@@ -83,17 +83,25 @@ struct tg_gui_backend {
     /* Apply a TG_GUI_STYLE_* bitmask to subsequent draw_text calls. NULL on
        backends that render plain (the renderer then just skips the markers). */
     void (*set_style)(tg_gui_backend *backend, int style);
-    /* OPTIONAL: distance from a draw_text baseline to the top of the glyph
-       cell (the font's ascent). Text is placed by baseline, so anything that
-       has to line up WITH the glyphs -- the caret -- needs this instead of
-       guessing from line_height, whose leading and descender depth vary with
-       the font. NULL falls back to the old approximation. */
+    /* OPTIONAL: baseline to top of the layout cell. A small font may sit
+       centred inside a taller emoji cell; caret/selection use that same cell.
+       NULL falls back to the old approximation. */
     int (*font_ascent)(tg_gui_backend *backend);
+    /* OPTIONAL: native font height, without emoji padding. Avatar dimensions
+       follow this metric so changing text spacing does not resize them.
+       NULL falls back to line_height minus the normal two-pixel leading. */
+    int (*font_height)(tg_gui_backend *backend);
     /* OPTIONAL: draw the peer's real avatar (decoded stripped thumb) into rect.
        Returns 1 when it drew, 0 to make the renderer fall back to the classic
        initials square. NULL on backends without image support (host tests). */
     int (*avatar_image)(tg_gui_backend *backend, unsigned long peer_id_hi,
                         unsigned long peer_id_lo, tg_gui_rect rect);
+    /* OPTIONAL: draw sheet glyph `index` scaled into the size x size square
+       at (x, y_top), index 0 of the palette left untouched. A backend whose
+       draw_text handles emoji pairs itself needs no caller to use this; it
+       is here for the picker grid. Returns 1 when drawn. */
+    int (*glyph_image)(tg_gui_backend *backend, unsigned long index, int x,
+                       int y_top, int size);
     /* OPTIONAL: replay a cached message photo into rect, clipped to the
        transcript viewport. Returns 1 when drawn, 0 for the text fallback. */
     int (*photo_image)(tg_gui_backend *backend, unsigned long photo_id_hi,
@@ -107,6 +115,10 @@ struct tg_gui_backend {
        the renderer sets it before every round-chrome call, avatars included,
        so the smoothed edge blends toward the right background. */
     void (*fill_pill)(tg_gui_backend *backend, int pen, tg_gui_rect rect);
+    /* OPTIONAL: opaque popup bounds, including the frame. A buffered backend
+       can restore these pixels after direct photo replay without drawing text
+       or allocating glyphs while the window's layer is locked. */
+    void (*popup_area)(tg_gui_backend *backend, tg_gui_rect rect);
     int round_bg;
 };
 
@@ -129,6 +141,30 @@ struct tg_gui_backend {
 #define TG_GUI_NAME_MAX 48
 #define TG_GUI_TEXT_MAX 256
 
+/* Emoji in Latin-1 text. An Amiga keyboard produces Latin-1, so an emoji in
+   the composer is a two byte escape: a prefix byte from the C1 control range,
+   which no keymap emits, followed by an index byte from 0x21..0x7E with '@'
+   left out (it would wake the mention popup). 93 slots per prefix, two
+   prefixes, 186 addressable glyphs, against 109 in the sheet today. The
+   backends measure and draw a pair as one square cell of the line height
+   showing the sheet glyph; the wrap never splits one; the send path expands
+   it to the codepoint's UTF-8. Reception can use the same pairs later, so a
+   received emoji and a sent one are the same thing on screen. */
+#define TG_GUI_EMOJI_PREFIX0 0x80U
+#define TG_GUI_EMOJI_PREFIX1 0x81U
+#define TG_GUI_EMOJI_INDEX_MIN 0x21U
+#define TG_GUI_EMOJI_INDEX_MAX 0x7EU
+#define TG_GUI_EMOJI_PER_PREFIX 93UL /* 0x21..0x7E minus '@' */
+#define TG_GUI_EMOJI_MAX (2UL * TG_GUI_EMOJI_PER_PREFIX)
+#define TG_GUI_EMOJI_RECENT_MAX 12
+/* 1 when a pair starts at text[i] (i < len), with its glyph index in *index. */
+int tg_gui_emoji_pair_at(const char *text, unsigned long len, unsigned long i,
+                         unsigned long *index);
+/* Writes the two bytes for glyph `index` into out[2]; 0 when out of range. */
+int tg_gui_emoji_encode(unsigned long index, char *out);
+/* Bytes of the text unit starting at text[i]: 2 for a pair, else 1. */
+unsigned long tg_gui_text_unit_len(const char *text, unsigned long len,
+                                   unsigned long i);
 /* '@' mention autocomplete popup (composer). */
 #define TG_GUI_MENTION_MAX 5
 #define TG_GUI_MENTION_LEN 40
@@ -208,6 +244,8 @@ typedef struct tg_gui_message {
     unsigned long photo_id_lo;
     unsigned long photo_width;
     unsigned long photo_height;
+    unsigned long pending_webpage_hi;
+    unsigned long pending_webpage_lo;
 } tg_gui_message;
 
 typedef struct tg_gui_state {
@@ -222,9 +260,13 @@ typedef struct tg_gui_state {
     int chat_scroll_to_sel; /* one-shot: next paint scrolls the list to selected_chat */
     int transcript_scroll; /* PIXELS scrolled up from the newest-pinned bottom (0 = newest) */
     int input_h;           /* composer box height (px), cached by the painter for the hit-test */
+    int nav_lh;            /* native font + leading, cached for sidebar mouse geometry */
     int inline_photos;     /* resolved GUI preference for this run */
     int inline_photos_explicit; /* user saved an on/off choice */
     int inline_photos_default_resolved; /* hardware default sampled this run */
+    int emoji_enabled;    /* picker and graphical emoji; off keeps text emoticons */
+    int emoji_explicit;   /* user saved an on/off choice */
+    int emoji_default_resolved;
     int photo_dither;      /* TG_GUI_PHOTO_DITHER_*; default full */
     unsigned long photo_cache_limit_mb; /* 0 unlimited; default 50 MiB */
     /* Scrollbar geometry the painter caches each frame for the event loop's
@@ -369,6 +411,11 @@ typedef struct tg_gui_state {
     int mention_active;
     int mention_count;
     int mention_sel;
+    /* Emoji picker (see tg_gui_emoji_open). Recents hold sheet indexes. */
+    int emoji_active;
+    int emoji_sel;        /* highlighted cell: recents first, then the sheet */
+    int emoji_recent_count;
+    unsigned short emoji_recent[12];
     int mention_start;
     char mention_items[TG_GUI_MENTION_MAX][TG_GUI_MENTION_LEN];
 
@@ -393,6 +440,27 @@ void tg_gui_paint(const tg_gui_state *state, tg_gui_backend *backend);
    DOS I/O under a layer lock can deadlock Intuition. */
 void tg_gui_paint_trail_off(void);
 
+/* Inserts glyph `index` at the composer caret (two bytes). 0 if full. */
+int tg_gui_composer_insert_emoji(tg_gui_state *state, unsigned long index);
+
+/* The emoji picker: a panel above the composer, the recently used row first,
+   then the whole sheet in a grid walked with the arrow keys or clicked.
+   ENTER (or a click) inserts the highlighted glyph at the caret and moves it
+   to the front of the recent row; ESC leaves. Recents persist in
+   data/telegram-emoji-recent.txt like the other preferences. */
+void tg_gui_emoji_open(tg_gui_state *state);
+void tg_gui_emoji_close(tg_gui_state *state);
+void tg_gui_emoji_move(tg_gui_state *state, int dx, int dy);
+/* Inserts the highlighted glyph; returns 1 when something went in. */
+int tg_gui_emoji_pick(tg_gui_state *state);
+/* Cell under (x, y) in the panel's own coordinates, or -1. */
+int tg_gui_emoji_cell_at(const tg_gui_state *state, int width, int lh,
+                         int x, int y);
+void tg_gui_emoji_recent_load(tg_gui_state *state);
+void tg_gui_emoji_recent_save(const tg_gui_state *state);
+extern int tg_gui_emoji_geom_y; /* panel top as last painted (tests, hit checks) */
+/* Sheet index of a codepoint, or -1 when the sheet has no glyph for it. */
+int tg_gui_emoji_index_of(unsigned long codepoint);
 /* Repaints ONLY the active caret region (composer input row in chat mode, login
    input box otherwise). Lets the ~2 Hz caret blink avoid a full-window repaint,
    which was visible as a constant refresh on slow OS3 planar displays. */
@@ -413,6 +481,12 @@ int tg_gui_input_layout_height(const tg_gui_state *state,
 #define TG_GUI_HIT_SEARCH (-4) /* the sidebar search box: focus it */
 #define TG_GUI_HIT_JUMP_BOTTOM (-5) /* the floating scroll-to-bottom button */
 #define TG_GUI_HIT_REPLY_CANCEL (-6) /* the "Replying to ..." composer header */
+/* The smiley button in the composer row that toggles the emoji picker. */
+#define TG_GUI_HIT_EMOJI_BUTTON (-7)
+#define TG_GUI_HIT_ATTACH_BUTTON (-8) /* paperclip opens the attachment picker */
+/* Emoji picker cells: TG_GUI_HIT_EMOJI_BASE + cell. Positive on purpose: the
+   message and photo ranges are negative and their dispatch tests "<=". */
+#define TG_GUI_HIT_EMOJI_BASE 1000
 /* Transcript message pick: message i -> (TG_GUI_HIT_MESSAGE_BASE - i). */
 #define TG_GUI_HIT_MESSAGE_BASE (-100)
 /* Photo pick: message i -> (TG_GUI_HIT_PHOTO_BASE - i). */
@@ -436,11 +510,23 @@ int tg_gui_photo_preferences_save(const char *path, int inline_photos,
                                   int inline_photos_explicit,
                                   int photo_dither,
                                   unsigned long photo_cache_limit_mb);
-/* Pure policy: explicit user choice always wins. Otherwise only classic OS3
-   disables inline photos when either a 68040-class CPU or RTG is missing. */
-int tg_gui_inline_photos_resolve(int explicit_choice, int explicit_value,
-                                 int classic_os3, int cpu_at_least_040,
-                                 int has_rtg);
+/* Shared photo/emoji policy: explicit user choice wins. Otherwise classic
+   Amiga hardware needs a 68040-class CPU (or PPC) and an actual RTG screen. */
+int tg_gui_graphics_resolve(int explicit_choice, int explicit_value,
+                            int classic_amiga, int cpu_at_least_040, int has_rtg);
+void tg_gui_graphics_preferences_resolve(tg_gui_state *state, int classic_amiga,
+                                        int cpu_at_least_040, int has_rtg);
+/* Separate from photos: missing/auto uses the hardware default. */
+void tg_gui_emoji_preferences_load(const char *path, int *enabled,
+                                   int *explicit_choice);
+int tg_gui_emoji_preferences_save(const char *path, int enabled);
+void tg_gui_set_emoji_enabled(tg_gui_state *state, int enabled);
+/* Zero means emoji disabled; otherwise a square of at least 16px. Line
+   height and ascent reserve that cell while keeping the actual font intact. */
+int tg_gui_emoji_inline_size(const tg_gui_state *state, int font_height);
+int tg_gui_font_line_height(const tg_gui_state *state, int font_height);
+int tg_gui_font_cell_ascent(const tg_gui_state *state, int font_height,
+                            int font_baseline);
 /* Compatibility wrappers for callers interested only in the first line. */
 int tg_gui_inline_photos_load(const char *path);
 int tg_gui_inline_photos_save(const char *path, int enabled);
@@ -505,10 +591,15 @@ int tg_gui_context_menu_measure(const tg_gui_state *state,
    message action. TG_MENU_DLDIR carries that separate command. */
 #define TG_GUI_CTX_ITEMS_MAX 10
 
-/* Pure helpers shared by the native save requester and host self-test. */
+/* Attachment chooser: known image extensions get the Photo/File dialog;
+   validation of the actual bytes still belongs to the upload gate. */
+int tg_gui_attachment_is_photo(const char *path);
+/* Save-as helpers shared by the native requester and host self-test. The
+   suggested extension follows the cached file's JPEG/PNG signature. */
 int tg_gui_photo_default_filename(char *out, unsigned long out_size,
                                   unsigned long photo_id_hi,
-                                  unsigned long photo_id_lo);
+                                  unsigned long photo_id_lo,
+                                  const char *source_path);
 int tg_gui_photo_build_destination(char *out, unsigned long out_size,
                                    const char *drawer, const char *name);
 int tg_gui_photo_save_allowed(int destination_exists,
@@ -638,6 +729,10 @@ int tg_gui_photo_preview_prepare_all(int count,
    nearest gap. Shared by the event loop (on drop) and the painter (insertion line)
    so they never disagree. */
 int tg_gui_chat_drop_target(const tg_gui_state *state, int lh, int y);
+
+/* Sidebar/header metric from the last paint, independent of emoji message
+   spacing. Before the first paint, use the caller's line-height fallback. */
+int tg_gui_navigation_line_height(const tg_gui_state *state, int fallback);
 
 /* The sidebar (chat-list) width for a window width -- shared with the event
    loop so a mouse-wheel can tell which panel the pointer is over. */
