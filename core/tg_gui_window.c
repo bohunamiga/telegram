@@ -1380,6 +1380,12 @@ static void tg_gui_av_reset(void)
         tg_gui_av_slots[i].state = 0;
     }
     tg_gui_av_pool_n = 0;
+    /* The emoji palette is resolved through this same pool, so its pen
+       numbers die with it: after an iconify (or a screen switch) the pool
+       is released and refilled with different pens, and a cache kept alive
+       here drew every glyph in whatever colours those old numbers had come
+       to mean (field report, AROS x86_64 at 24 bits). */
+    tg_gui_emoji_pen_ready = 0;
     tg_gui_av_evict = 0UL;
     tg_gui_photo_slots_reset();
 }
