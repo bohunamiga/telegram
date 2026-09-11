@@ -8,6 +8,12 @@ unless noted.
 ## [Unreleased]
 
 ### Added
+- When the code Telegram delivers inside its app does not show up, the
+  login screen offers the other route Telegram proposes for it, usually
+  an SMS: press S once the wait it asks for has passed. The text client
+  takes S at its code prompt too. The route and the wait were already in
+  Telegram's answer and were being thrown away; the debug log now records
+  both next to the delivery type.
 - A paperclip at the left of the composer opens the attachment requester.
   JPEG and PNG attachments offer Photo, File or Cancel, with the existing
   caption dialog; other attachments follow the file upload path. It remains

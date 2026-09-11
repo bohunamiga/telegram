@@ -16,6 +16,7 @@
 #define TG_CODE_SETTINGS_CONSTRUCTOR 0xad253d78UL
 #define TG_AUTH_SEND_CODE_CONSTRUCTOR 0xa677244fUL
 #define TG_AUTH_SIGN_IN_CONSTRUCTOR 0x8d52a951UL
+#define TG_AUTH_RESEND_CODE_CONSTRUCTOR 0xcae47523UL
 #define TG_AUTH_SIGN_UP_CONSTRUCTOR 0xaac7b717UL
 #define TG_AUTH_CHECK_PASSWORD_CONSTRUCTOR 0xd18b4d16UL
 #define TG_HELP_GET_CONFIG_CONSTRUCTOR 0xc4f9186bUL
@@ -454,6 +455,33 @@ tg_mtproto_tl_status tg_mtproto_build_auth_send_code(
     }
     if (status == TG_MTPROTO_TL_OK) {
         status = tg_mtproto_tl_write_u32(writer, 0UL);
+    }
+    return status;
+}
+
+/* auth.resendCode#cae47523 flags:# phone_number:string phone_code_hash:string
+   reason:flags.0?string = auth.SentCode (core.telegram.org, 2026-09-10). The
+   reason is for device-integrity failures on phones; we never set it. */
+tg_mtproto_tl_status tg_mtproto_build_auth_resend_code(
+    tg_mtproto_tl_writer *writer,
+    const char *phone_number,
+    const char *phone_code_hash)
+{
+    tg_mtproto_tl_status status;
+
+    if (writer == 0 || phone_number == 0 || phone_code_hash == 0 ||
+        phone_number[0] == '\0' || phone_code_hash[0] == '\0') {
+        return TG_MTPROTO_TL_INVALID_ARGUMENT;
+    }
+    status = tg_mtproto_tl_write_u32(writer, TG_AUTH_RESEND_CODE_CONSTRUCTOR);
+    if (status == TG_MTPROTO_TL_OK) {
+        status = tg_mtproto_tl_write_u32(writer, 0UL); /* flags: no reason */
+    }
+    if (status == TG_MTPROTO_TL_OK) {
+        status = tg_write_string(writer, phone_number);
+    }
+    if (status == TG_MTPROTO_TL_OK) {
+        status = tg_write_string(writer, phone_code_hash);
     }
     return status;
 }
@@ -2676,7 +2704,6 @@ tg_mtproto_tl_status tg_mtproto_parse_auth_sent_code(
 {
     tg_mtproto_tl_reader reader;
     unsigned long flags;
-    unsigned long unused;
     tg_mtproto_tl_status status;
 
     if (body == 0 || out == 0) {
@@ -2711,8 +2738,14 @@ tg_mtproto_tl_status tg_mtproto_parse_auth_sent_code(
         status = tg_read_string_copy(&reader, out->phone_code_hash,
                                      sizeof(out->phone_code_hash));
     }
+    /* next_type (an auth.CodeType, a bare constructor) is the route
+       auth.resendCode would use, and timeout is how many seconds to wait
+       before asking for it: the two facts behind "send it by SMS
+       instead", which the official apps offer and this client used to
+       throw away. */
     if (status == TG_MTPROTO_TL_OK && (flags & 2UL) != 0UL) {
-        status = tg_mtproto_tl_read_u32(&reader, &unused);
+        status = tg_mtproto_tl_read_u32(&reader, &out->next_type);
+        out->has_next_type = (status == TG_MTPROTO_TL_OK);
     }
     if (status == TG_MTPROTO_TL_OK && (flags & 4UL) != 0UL) {
         status = tg_mtproto_tl_read_u32(&reader, &out->timeout);
@@ -6904,6 +6937,42 @@ int tg_mtproto_login_self_test(void)
         !sent_code.has_type_length ||
         strcmp(sent_code.phone_code_hash, "hash") != 0) {
         return 2;
+    }
+    /* auth.resendCode, and the two sentCode fields behind it: the route it
+       would take (flags.1 next_type) and the wait before asking (flags.2). */
+    {
+        static const unsigned char expected_resend[] = {
+            0x23U, 0x75U, 0xe4U, 0xcaU,
+            0x00U, 0x00U, 0x00U, 0x00U,
+            0x02U, '+', '1', 0x00U,
+            0x04U, 'h', 'a', 's', 'h', 0x00U, 0x00U, 0x00U
+        };
+
+        tg_mtproto_tl_writer_init(&writer, query, sizeof(query));
+        if (tg_mtproto_build_auth_resend_code(&writer, "+1", "hash") !=
+                TG_MTPROTO_TL_OK ||
+            writer.length != sizeof(expected_resend) ||
+            memcmp(query, expected_resend, sizeof(expected_resend)) != 0) {
+            return 2;
+        }
+        tg_mtproto_tl_writer_init(&writer, rpc, sizeof(rpc));
+        if (tg_mtproto_tl_write_u32(&writer, 6UL) != TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 0x3dbb5986UL) !=
+                TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 5UL) != TG_MTPROTO_TL_OK ||
+            tg_write_string(&writer, "hash") != TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 0x72a3158cUL) !=
+                TG_MTPROTO_TL_OK ||
+            tg_mtproto_tl_write_u32(&writer, 60UL) != TG_MTPROTO_TL_OK ||
+            tg_mtproto_parse_auth_sent_code(TG_AUTH_SENT_CODE_CONSTRUCTOR, rpc,
+                                            writer.length, &sent_code) !=
+                TG_MTPROTO_TL_OK ||
+            !sent_code.has_next_type ||
+            sent_code.next_type != 0x72a3158cUL ||
+            !sent_code.has_timeout || sent_code.timeout != 60UL ||
+            strcmp(sent_code.phone_code_hash, "hash") != 0) {
+            return 2;
+        }
     }
 
     tg_mtproto_tl_writer_init(&writer, query, sizeof(query));

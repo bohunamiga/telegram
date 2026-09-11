@@ -233,6 +233,14 @@ const char *tg_mtproto_sent_code_hint(void);
 /* Digits Telegram says the code has, 0 when it did not say. */
 unsigned long tg_mtproto_sent_code_length(void);
 
+/* The other route Telegram offers when the code does not arrive ("by SMS",
+   "by phone call", ...), from next_type; 0 when it offered none. */
+const char *tg_mtproto_sent_code_next_route(void);
+
+/* Seconds before Telegram accepts a resend (its timeout), 0 when it may be
+   asked now. */
+unsigned long tg_mtproto_sent_code_resend_wait(void);
+
 int tg_gui_session_send(const char *text, unsigned long reply_to_msg_id,
                         FILE *stream);
 
@@ -356,6 +364,11 @@ int tg_gui_session_login_send_code(const char *phone, FILE *stream);
    activate); TG_GUI_LOGIN_NEED_2FA = ask for the password; TG_GUI_LOGIN_BAD_CODE
    = re-prompt. */
 int tg_gui_session_login_sign_in(const char *code, FILE *stream);
+
+/* Asks Telegram to send the pending code by its next route (auth.resendCode),
+   for a code that never arrived inside the app. TG_GUI_LOGIN_OK = sent again
+   (the prompt should say the new route); otherwise last_error says why. */
+int tg_gui_session_login_resend_code(FILE *stream);
 
 /* Submits the 2FA `password` (SRP auth.checkPassword). TG_GUI_LOGIN_OK = logged
    in (call activate); TG_GUI_LOGIN_BAD_PASSWORD = re-prompt. */

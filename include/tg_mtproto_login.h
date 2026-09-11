@@ -42,6 +42,8 @@ typedef struct tg_mtproto_sent_code {
     unsigned long timeout;
     int has_timeout;
     int has_type_length;
+    unsigned long next_type; /* auth.CodeType of the next route, 0 if none */
+    int has_next_type;
     char phone_code_hash[128];
 } tg_mtproto_sent_code;
 
@@ -524,6 +526,13 @@ tg_mtproto_tl_status tg_mtproto_build_auth_sign_in(
     const char *phone_number,
     const char *phone_code_hash,
     const char *phone_code);
+
+/* auth.resendCode: ask Telegram to send the pending code by the route it
+   named as next_type in the previous auth.sentCode (usually SMS). */
+tg_mtproto_tl_status tg_mtproto_build_auth_resend_code(
+    tg_mtproto_tl_writer *writer,
+    const char *phone_number,
+    const char *phone_code_hash);
 
 tg_mtproto_tl_status tg_mtproto_build_auth_sign_up(
     tg_mtproto_tl_writer *writer,

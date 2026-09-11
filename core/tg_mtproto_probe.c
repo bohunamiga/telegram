@@ -1914,6 +1914,26 @@ static const char *tg_mtproto_sent_code_text(unsigned long type_constructor,
     }
 }
 
+/* The route auth.resendCode would take, from the auth.CodeType Telegram put
+   in next_type (core.telegram.org/type/auth.CodeType, 2026-09-11). */
+static const char *tg_mtproto_code_route_text(unsigned long code_type)
+{
+    switch (code_type) {
+    case 0x72a3158cUL: /* auth.codeTypeSms */
+        return "by SMS";
+    case 0x741cd3e3UL: /* auth.codeTypeCall */
+        return "by phone call";
+    case 0x226ccefbUL: /* auth.codeTypeFlashCall */
+        return "by a flash call";
+    case 0xd61ad6eeUL: /* auth.codeTypeMissedCall */
+        return "by a missed call";
+    case 0x06ed998cUL: /* auth.codeTypeFragmentSms */
+        return "via fragment.com";
+    default:
+        return 0;
+    }
+}
+
 static void tg_mtproto_print_login_code_hint(FILE *stream,
                                              unsigned long type_constructor)
 {
@@ -3795,12 +3815,23 @@ static int tg_mtproto_send_saved_query(const char *host,
    already, and until now thrown away. */
 static unsigned long tg_mtproto_sent_code_type;
 static unsigned long tg_mtproto_sent_code_len;
+/* ...and what Telegram offers when it does not arrive: the next route
+   (auth.CodeType, 0 = none), the seconds to wait before asking for it, and
+   when the answer came, so the wait can be counted down. */
+static unsigned long tg_mtproto_sent_code_next;
+static unsigned long tg_mtproto_sent_code_wait;
+static unsigned long tg_mtproto_sent_code_at;
 
 static void tg_mtproto_remember_sent_code(const tg_mtproto_sent_code *sc)
 {
     tg_mtproto_sent_code_type = (sc != 0) ? sc->type_constructor : 0UL;
     tg_mtproto_sent_code_len =
         (sc != 0 && sc->has_type_length) ? sc->type_length : 0UL;
+    tg_mtproto_sent_code_next =
+        (sc != 0 && sc->has_next_type) ? sc->next_type : 0UL;
+    tg_mtproto_sent_code_wait =
+        (sc != 0 && sc->has_timeout) ? sc->timeout : 0UL;
+    tg_mtproto_sent_code_at = (unsigned long)time(0);
 }
 
 const char *tg_mtproto_sent_code_hint(void)
@@ -3811,6 +3842,22 @@ const char *tg_mtproto_sent_code_hint(void)
 unsigned long tg_mtproto_sent_code_length(void)
 {
     return tg_mtproto_sent_code_len;
+}
+
+const char *tg_mtproto_sent_code_next_route(void)
+{
+    return tg_mtproto_code_route_text(tg_mtproto_sent_code_next);
+}
+
+unsigned long tg_mtproto_sent_code_resend_wait(void)
+{
+    unsigned long now = (unsigned long)time(0);
+    unsigned long ready = tg_mtproto_sent_code_at + tg_mtproto_sent_code_wait;
+
+    if (tg_mtproto_sent_code_wait == 0UL || now >= ready) {
+        return 0UL;
+    }
+    return ready - now;
 }
 
 int tg_mtproto_auth_send_code(const char *host,
@@ -4158,6 +4205,207 @@ int tg_mtproto_auth_sign_in_file(const char *host,
                                  code_hash_file, phone_code, dc_id_text,
                                  stream);
     return rc;
+}
+
+/* auth.resendCode, on the auth key that asked for the code (the
+   phone_code_hash belongs to it, so this loads the saved context like signIn
+   does), then the same bookkeeping as sendCode: remember the new route,
+   store the new hash, say where the code went. The refusals come back as
+   short sentences with "failed" in them, which is what the GUI's quiet
+   stream picks up for its status line. 0 = sent again. */
+int tg_mtproto_auth_resend_code(const char *host,
+                                const char *port,
+                                const char *api_id_text,
+                                const char *auth_file,
+                                const char *phone_number,
+                                const char *code_hash_file,
+                                const char *dc_id_text,
+                                FILE *stream)
+{
+    unsigned char query[512];
+    unsigned char initialized_query[640];
+    unsigned char wrapped_query[760];
+    char code_hash[160];
+    unsigned long code_hash_length;
+    unsigned long api_id;
+    unsigned long query_length;
+    tg_file_status file_status;
+    tg_mtproto_auth_context context;
+    tg_mtproto_rpc_result result;
+    tg_mtproto_sent_code sent_code;
+    tg_mtproto_session_status session_status;
+    tg_mtproto_tl_writer writer;
+    long dc_id;
+    int qrc;
+    static const char label[] = "mtproto auth.resendCode";
+
+    if (stream == 0 || host == 0 || port == 0 || api_id_text == 0 ||
+        auth_file == 0 || phone_number == 0 || code_hash_file == 0 ||
+        tg_mtproto_parse_dc_id(dc_id_text, &dc_id) != 0 ||
+        tg_mtproto_parse_ulong_arg(api_id_text, &api_id) != 0) {
+        if (stream != 0) {
+            fputs("mtproto auth.resendCode: invalid-arguments\n", stream);
+        }
+        return 2;
+    }
+    file_status = tg_file_read_text(code_hash_file, code_hash,
+                                    sizeof(code_hash), &code_hash_length);
+    if (file_status != TG_FILE_OK) {
+        fprintf(stream, "%s: code-hash-load-failed (%s)\n", label,
+                tg_file_status_name(file_status));
+        return 2;
+    }
+    tg_mtproto_trim_line(code_hash);
+    if (code_hash[0] == '\0') {
+        fprintf(stream, "%s: code-hash-empty\n", label);
+        return 2;
+    }
+    if (tg_mtproto_load_auth_context(host, port, auth_file, &context, stream,
+                                     label) != 0) {
+        return 2;
+    }
+    context.session.dc_id = (unsigned long)dc_id;
+
+    tg_mtproto_login_phase(stream, "auth.resendCode build");
+    tg_mtproto_tl_writer_init(&writer, query, sizeof(query));
+    if (tg_mtproto_build_auth_resend_code(&writer, phone_number, code_hash) !=
+        TG_MTPROTO_TL_OK) {
+        tg_mtproto_close_auth_context(&context);
+        fprintf(stream, "%s: query-build-failed\n", label);
+        return 2;
+    }
+    query_length = writer.length;
+    tg_mtproto_tl_writer_init(&writer, initialized_query,
+                              sizeof(initialized_query));
+    if (tg_mtproto_build_init_connection(&writer, api_id, "Amiga",
+                                         "portable", "0.1", "en", query,
+                                         query_length) != TG_MTPROTO_TL_OK) {
+        tg_mtproto_close_auth_context(&context);
+        fprintf(stream, "%s: init-connection-build-failed\n", label);
+        return 2;
+    }
+    query_length = writer.length;
+    tg_mtproto_tl_writer_init(&writer, wrapped_query, sizeof(wrapped_query));
+    if (tg_mtproto_build_invoke_with_layer(&writer, 214UL, initialized_query,
+                                           query_length) !=
+        TG_MTPROTO_TL_OK) {
+        tg_mtproto_close_auth_context(&context);
+        fprintf(stream, "%s: invoke-layer-build-failed\n", label);
+        return 2;
+    }
+
+    tg_mtproto_login_phase(stream, "auth.resendCode send");
+    qrc = tg_mtproto_send_encrypted_query_login(
+        &context, wrapped_query, writer.length, &result, stream, label);
+    if (qrc != 0) {
+        if (qrc == TG_MTPROTO_QUERY_SOFT_FAIL) {
+            session_status = tg_mtproto_session_save_authorization(
+                auth_file, &context.session, context.auth_key, 1);
+            if (session_status != TG_MTPROTO_SESSION_OK) {
+                fprintf(stream, "%s: auth-file-save-failed (%s)\n", label,
+                        tg_mtproto_session_status_name(session_status));
+            }
+        }
+        tg_mtproto_close_auth_context(&context);
+        return 2;
+    }
+    tg_mtproto_login_phase(stream, "auth.resendCode response");
+    tg_mtproto_skip_auth_context_close(&context, stream, label);
+
+    session_status = tg_mtproto_session_save_authorization(
+        auth_file, &context.session, context.auth_key, 1);
+    if (session_status != TG_MTPROTO_SESSION_OK) {
+        fprintf(stream, "%s: auth-file-save-failed (%s)\n", label,
+                tg_mtproto_session_status_name(session_status));
+        return 2;
+    }
+
+    if (result.result_constructor == TG_MTPROTO_RPC_ERROR_CONSTRUCTOR) {
+        char resend_error[128];
+        long resend_error_code;
+
+        if (tg_mtproto_parse_rpc_error(result.result_body - 4U,
+                                       result.result_body_length + 4U,
+                                       &resend_error_code, resend_error,
+                                       sizeof(resend_error)) ==
+            TG_MTPROTO_TL_OK) {
+            if (strcmp(resend_error, "SEND_CODE_UNAVAILABLE") == 0) {
+                fputs("Resend failed: no other way to send it\n", stream);
+                return 2;
+            }
+            if (strcmp(resend_error, "PHONE_CODE_EXPIRED") == 0) {
+                fputs("Resend failed: the code expired, press ESC\n",
+                      stream);
+                return 2;
+            }
+            if (strncmp(resend_error, "FLOOD_WAIT_", 11) == 0) {
+                fprintf(stream, "Resend failed: too many tries, wait %.10s s\n",
+                        resend_error + 11);
+                return 2;
+            }
+        }
+        if (!tg_mtproto_print_rpc_error(label, &result, stream)) {
+            fprintf(stream, "%s: rpc-error-parse-failed\n", label);
+        }
+        return 2;
+    }
+    if (tg_mtproto_unpack_gzip_result(&result, stream, label) != 0) {
+        return 2;
+    }
+    if (result.result_constructor != TG_MTPROTO_AUTH_SENT_CODE_CONSTRUCTOR &&
+        result.result_constructor !=
+            TG_MTPROTO_AUTH_SENT_CODE_PAYMENT_REQUIRED_CONSTRUCTOR &&
+        result.result_constructor !=
+            TG_MTPROTO_AUTH_SENT_CODE_SUCCESS_CONSTRUCTOR) {
+        fprintf(stream, "%s: unexpected-result 0x%08lx\n", label,
+                result.result_constructor);
+        return 2;
+    }
+    if (tg_mtproto_parse_auth_sent_code(result.result_constructor,
+                                        result.result_body,
+                                        result.result_body_length,
+                                        &sent_code) != TG_MTPROTO_TL_OK ||
+        sent_code.phone_code_hash[0] == '\0') {
+        fprintf(stream, "%s: sent-code-parse-failed\n", label);
+        return 2;
+    }
+    tg_mtproto_remember_sent_code(&sent_code);
+    file_status = tg_file_write_text(code_hash_file, sent_code.phone_code_hash,
+                                     (unsigned long)strlen(
+                                         sent_code.phone_code_hash));
+    if (file_status == TG_FILE_OK) {
+        file_status = tg_file_append_text(code_hash_file, "\n", 1UL);
+    }
+    if (file_status != TG_FILE_OK) {
+        fprintf(stream, "%s: code-hash-save-failed (%s)\n", label,
+                tg_file_status_name(file_status));
+        return 2;
+    }
+    fprintf(stream, "Login code sent again.\n");
+    tg_mtproto_print_login_code_hint(stream, sent_code.type_constructor);
+    fflush(stream);
+    return 0;
+}
+
+int tg_mtproto_auth_resend_code_file(const char *host,
+                                     const char *port,
+                                     const char *api_file,
+                                     const char *auth_file,
+                                     const char *phone_number,
+                                     const char *code_hash_file,
+                                     const char *dc_id_text,
+                                     FILE *stream)
+{
+    char api_id[32];
+    static const char label[] = "mtproto auth.resendCode";
+
+    if (tg_mtproto_load_api_id_file(api_file, api_id, sizeof(api_id),
+                                    stream, label) != 0) {
+        return 2;
+    }
+    return tg_mtproto_auth_resend_code(host, port, api_id, auth_file,
+                                       phone_number, code_hash_file,
+                                       dc_id_text, stream);
 }
 
 int tg_mtproto_auth_sign_up(const char *host,
@@ -4915,7 +5163,14 @@ int tg_mtproto_auth_login_wizard_file(const char *host,
        2FA challenge (which then failed confusingly on checkPassword). */
     rc = TG_MTPROTO_SIGN_IN_CODE_INVALID;
     while (rc == TG_MTPROTO_SIGN_IN_CODE_INVALID) {
+        const char *route =
+            tg_mtproto_code_route_text(tg_mtproto_sent_code_next);
+
         fprintf(stream, "Type the Telegram code and press Return.\n");
+        if (route != 0) {
+            fprintf(stream, "No code? Type S and press Return to get it %s.\n",
+                    route);
+        }
         fflush(stream);
         if (tg_mtproto_prompt_line("Telegram code (empty to abort): ", code,
                                    sizeof(code), 0, stream, label) != 0) {
@@ -4926,6 +5181,28 @@ int tg_mtproto_auth_login_wizard_file(const char *host,
             tg_mtproto_secure_zero(phone, sizeof(phone));
             fprintf(stream, "%s: aborted\n", label);
             return 2;
+        }
+        if ((code[0] == 's' || code[0] == 'S') && code[1] == '\0') {
+            /* The in-app code never came: ask Telegram for its next route
+               (auth.resendCode), as the official apps offer after a wait. */
+            unsigned long wait = tg_mtproto_sent_code_resend_wait();
+
+            tg_mtproto_secure_zero(code, sizeof(code));
+            if (route == 0) {
+                fprintf(stream,
+                        "Telegram offered no other way to send this code.\n");
+            } else if (wait > 0UL) {
+                fprintf(stream, "Telegram allows that in %lu seconds: "
+                                "type S again then.\n", wait);
+            } else {
+                fprintf(stream, "Asking Telegram to send the code %s.\n",
+                        route);
+                fflush(stream);
+                (void)tg_mtproto_auth_resend_code_file(
+                    current_host, port, api_file, auth_file, phone,
+                    code_hash_file, current_dc_id_text, stream);
+            }
+            continue;
         }
         fprintf(stream, "Checking Telegram code.\n");
         fflush(stream);
@@ -17360,6 +17637,25 @@ static int tg_mtproto_sent_code_text_self_test(void)
             return 2;
         }
     }
+    {
+        static const unsigned long routes[] = {
+            0x72a3158cUL, 0x741cd3e3UL, 0x226ccefbUL, 0xd61ad6eeUL,
+            0x06ed998cUL
+        };
+
+        for (i = 0UL; i < sizeof(routes) / sizeof(routes[0]); ++i) {
+            if (tg_mtproto_code_route_text(routes[i]) == 0) {
+                printf("mtproto self-test: no route for code type 0x%08lx\n",
+                       routes[i]);
+                return 2;
+            }
+        }
+        if (tg_mtproto_code_route_text(0x12345678UL) != 0 ||
+            strcmp(tg_mtproto_code_route_text(0x72a3158cUL), "by SMS") != 0) {
+            puts("mtproto self-test: resend route texts");
+            return 2;
+        }
+    }
     /* The email-required answer must not promise a code. */
     if (strstr(tg_mtproto_sent_code_text(0xa5491deaUL, 0),
                "No code is coming") == 0) {
@@ -19810,6 +20106,19 @@ void tg_gui_session_login_begin(const char *api_file, const char *auth_file,
                       "data/phone-code-hash.txt");
 }
 
+/* The line that answers "where did the code go, and what comes next" from a
+   log the user can send us, instead of from a photograph of the window. */
+static void tg_gui_log_sent_code_route(void)
+{
+    char route[160];
+
+    sprintf(route, "login: sent code type 0x%08lx, %lu digits, "
+                   "next 0x%08lx, wait %lu s",
+            tg_mtproto_sent_code_type, tg_mtproto_sent_code_length(),
+            tg_mtproto_sent_code_next, tg_mtproto_sent_code_wait);
+    tg_gui_log(route);
+}
+
 int tg_gui_session_login_send_code(const char *phone, FILE *stream)
 {
     char api_id[32];
@@ -19877,15 +20186,7 @@ int tg_gui_session_login_send_code(const char *phone, FILE *stream)
         }
     }
     tg_gui_log("login: send_code done");
-    {
-        /* The one line that answers "where did the code go" from a log the
-           user can send us, instead of from a screenshot of the window. */
-        char route[80];
-
-        sprintf(route, "login: sent code type 0x%08lx, %lu digits",
-                tg_mtproto_sent_code_type, tg_mtproto_sent_code_length());
-        tg_gui_log(route);
-    }
+    tg_gui_log_sent_code_route();
     if (rc != 0) {
         tg_mtproto_capture_quiet_error(
             quiet, stream, tg_gui_session_state.login.last_error,
@@ -19895,6 +20196,43 @@ int tg_gui_session_login_send_code(const char *phone, FILE *stream)
     tg_net_set_connect_timeout_seconds(prev_timeout);
     tg_mtproto_secure_zero(api_hash, sizeof(api_hash));
     return (rc == 0) ? TG_GUI_LOGIN_OK : TG_GUI_LOGIN_BAD_PHONE;
+}
+
+int tg_gui_session_login_resend_code(FILE *stream)
+{
+    unsigned long prev_timeout;
+    FILE *quiet;
+    int rc;
+
+    if (!tg_gui_session_state.login.active || stream == 0 ||
+        tg_gui_session_state.login.phone[0] == '\0' ||
+        tg_gui_session_state.login.api_id[0] == '\0') {
+        return TG_GUI_LOGIN_ERROR;
+    }
+    tg_gui_session_state.login.last_error[0] = '\0';
+    prev_timeout = tg_net_connect_timeout_seconds();
+    tg_net_set_connect_timeout_seconds(45UL);
+    /* Same quiet stream as send_code: no console output during network I/O
+       (the MorphOS freeze), and the refusal sentence is read back from it. */
+    quiet = tg_mtproto_open_quiet_stream(stream);
+    tg_gui_log("login: resend_code start");
+    rc = tg_mtproto_auth_resend_code(tg_gui_session_state.login.host, "443",
+                                     tg_gui_session_state.login.api_id,
+                                     tg_gui_session_state.login.auth_file,
+                                     tg_gui_session_state.login.phone,
+                                     tg_gui_session_state.login.code_hash_file,
+                                     tg_gui_session_state.login.dc_id_text,
+                                     quiet);
+    tg_gui_log(rc == 0 ? "login: resend_code done" : "login: resend_code FAIL");
+    tg_gui_log_sent_code_route();
+    if (rc != 0) {
+        tg_mtproto_capture_quiet_error(
+            quiet, stream, tg_gui_session_state.login.last_error,
+            sizeof(tg_gui_session_state.login.last_error));
+    }
+    tg_mtproto_close_quiet_stream(quiet, stream);
+    tg_net_set_connect_timeout_seconds(prev_timeout);
+    return (rc == 0) ? TG_GUI_LOGIN_OK : TG_GUI_LOGIN_ERROR;
 }
 
 int tg_gui_session_login_sign_in(const char *code, FILE *stream)

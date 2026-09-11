@@ -89,7 +89,9 @@ fill_platform_text() {
    Telegram sends you. That code usually does NOT arrive by SMS: if you are
    signed in to Telegram anywhere else (phone, PC, web), it is delivered
    INSIDE Telegram, as a message from the official Telegram service chat.
-   The client tells you on screen where it was sent.
+   The client tells you on screen where it was sent. If nothing arrives,
+   wait until the code screen offers another way and press S: Telegram
+   then sends the code again, usually by SMS.
    If your account has a cloud password (2FA), type it on the masked screen
    (if you do NOT have one, just press Enter to continue).
 3. The client logs in and writes telegram-auth.bin in this drawer. After that
@@ -101,6 +103,8 @@ fill_platform_text() {
    SMS: se sei collegato a Telegram da qualche altra parte (telefono, PC,
    web), te lo consegna DENTRO Telegram, come messaggio della chat
    ufficiale Telegram. Il client ti dice a schermo dove e' stato spedito.
+   Se non arriva nulla, aspetta che la schermata del codice proponga
+   un'altra via e premi S: Telegram lo rimanda, di solito via SMS.
    Se il tuo account ha una password cloud (2FA), digitala sulla schermata
    mascherata (se NON ce l'hai, premi Invio).
 3. Il client accede e scrive telegram-auth.bin in questo drawer. Da li' in poi
@@ -232,7 +236,9 @@ then double-click TelegramAmiga-TUI."
    Telegram sends you. That code usually does NOT arrive by SMS: if you are
    signed in to Telegram anywhere else (phone, PC, web), it is delivered
    INSIDE Telegram, as a message from the official Telegram service chat.
-   The client tells you on screen where it was sent.
+   The client tells you on screen where it was sent. If nothing arrives,
+   wait until the code screen offers another way and press S: Telegram
+   then sends the code again, usually by SMS.
    If your account has a cloud password (2FA), type it on the masked screen
    (if you do NOT have one, just press Enter to continue).
 3. The client logs in and writes telegram-auth.bin in this drawer. After that
@@ -244,6 +250,8 @@ then double-click TelegramAmiga-TUI."
    SMS: se sei collegato a Telegram da qualche altra parte (telefono, PC,
    web), te lo consegna DENTRO Telegram, come messaggio della chat
    ufficiale Telegram. Il client ti dice a schermo dove e' stato spedito.
+   Se non arriva nulla, aspetta che la schermata del codice proponga
+   un'altra via e premi S: Telegram lo rimanda, di solito via SMS.
    Se il tuo account ha una password cloud (2FA), digitala sulla schermata
    mascherata (se NON ce l'hai, premi Invio).
 3. Il client accede e scrive telegram-auth.bin in questo drawer. Da li' in poi

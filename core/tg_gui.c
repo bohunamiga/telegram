@@ -4069,6 +4069,20 @@ static void tg_gui_paint_login(const tg_gui_state *state,
     }
     tg_gui_draw_centered(backend, TG_GUI_PEN_TEXT_DIM, width, mid + (3 * lh),
                          "ENTER confirms   ESC quits");
+    if (state->mode == TG_GUI_MODE_LOGIN_CODE) {
+        /* When Telegram named another route, say how to ask for it: the
+           in-app code does not always show up, and the official apps offer
+           the same way out after a wait. */
+        const char *route = tg_mtproto_sent_code_next_route();
+
+        if (route != 0) {
+            char hint[64];
+
+            sprintf(hint, "No code? Press S to get it %.24s", route);
+            tg_gui_draw_centered(backend, TG_GUI_PEN_TEXT_DIM, width,
+                                 mid + (4 * lh) + 2, hint);
+        }
+    }
     if (!tg_gui_first_paint_logged) {
         tg_gui_log("login paint: done");
         tg_gui_first_paint_logged = 1;

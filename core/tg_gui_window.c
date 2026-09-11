@@ -5111,6 +5111,46 @@ static void tg_gui_window_login_key(tg_gui_state *state, UWORD code,
         }
         return;
     }
+    if (state->mode == TG_GUI_MODE_LOGIN_CODE &&
+        (code == 's' || code == 'S')) {
+        /* A code is digits only, so S is free: the in-app code never came,
+           ask Telegram for its next route (auth.resendCode), the "send it by
+           SMS" the official apps offer after a wait. */
+        const char *route = tg_mtproto_sent_code_next_route();
+        unsigned long wait = tg_mtproto_sent_code_resend_wait();
+        char line[TG_GUI_NAME_MAX];
+
+        if (route == 0) {
+            tg_gui_window_copy(state->status, sizeof(state->status),
+                               "Telegram offers no other way");
+        } else if (wait > 0UL) {
+            sprintf(line, "Wait %lu s, then press S again",
+                    wait > 9999UL ? 9999UL : wait);
+            tg_gui_window_copy(state->status, sizeof(state->status), line);
+        } else {
+            int rc;
+
+            tg_gui_window_copy(state->status, sizeof(state->status),
+                               "Asking Telegram to resend...");
+            state->cursor_on = 0;
+            tg_gui_window_paint(state, backend);
+            rc = tg_gui_session_login_resend_code(stdout);
+            state->input[0] = '\0';
+            if (rc == TG_GUI_LOGIN_OK) {
+                tg_gui_window_login_code_prompt(state); /* the new route */
+            } else {
+                const char *e = tg_gui_session_login_last_error();
+
+                tg_gui_window_copy(state->status, sizeof(state->status),
+                                   (e != 0 && e[0] != '\0')
+                                       ? e : "Resend failed - try again");
+            }
+        }
+        state->cursor_on = 1;
+        *caret_ticks = 0;
+        tg_gui_window_paint(state, backend);
+        return;
+    }
     if (code != 13 && code != 10) { /* a printable character */
         if (code >= 32 && code < 256) {
             unsigned long n;
