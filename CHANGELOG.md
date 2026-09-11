@@ -55,6 +55,15 @@ unless noted.
   client's /photo all take .png alongside .jpg.
 
 ### Fixed
+- A new login gets its code again. Telegram had stopped delivering the
+  in-app login code to this client: it accepted the request, said the code
+  was on its way inside the app, and nothing ever reached the phone, on more
+  than one account and with more than one api key. The connection now
+  declares its system language as a full locale, en-US, instead of a bare
+  en, the change other third-party clients found to bring the codes back;
+  on a number where two requests in half an hour had produced nothing, the
+  first one after it arrived. Logins that were already saved were never
+  affected.
 - The login screen no longer promises a code Telegram is not sending. One
   delivery answer means "add and verify a login email first", and it used to
   read like any other, so a first user waited for a message that could never

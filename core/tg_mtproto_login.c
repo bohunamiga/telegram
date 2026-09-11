@@ -17,6 +17,14 @@
 #define TG_AUTH_SEND_CODE_CONSTRUCTOR 0xa677244fUL
 #define TG_AUTH_SIGN_IN_CONSTRUCTOR 0x8d52a951UL
 #define TG_AUTH_RESEND_CODE_CONSTRUCTOR 0xcae47523UL
+/* initConnection's system_lang_code. Telegram accepted auth.sendCode from a
+   connection that declared a bare "en" here, answered that the code was on
+   its way inside the app, and then never delivered it, on more than one
+   account (2026-09, AROS x86_64 and a forum report). Other third-party
+   clients hit the same silence in 2026 and found that a full locale, en-US,
+   brings the codes back; on a number where two requests in half an hour had
+   produced nothing, the first one with en-US arrived. lang_code stays "en". */
+#define TG_MTPROTO_SYSTEM_LANG_CODE "en-US"
 #define TG_AUTH_SIGN_UP_CONSTRUCTOR 0xaac7b717UL
 #define TG_AUTH_CHECK_PASSWORD_CONSTRUCTOR 0xd18b4d16UL
 #define TG_HELP_GET_CONFIG_CONSTRUCTOR 0xc4f9186bUL
@@ -414,7 +422,7 @@ tg_mtproto_tl_status tg_mtproto_build_init_connection(
         status = tg_write_string(writer, app_version);
     }
     if (status == TG_MTPROTO_TL_OK) {
-        status = tg_write_string(writer, lang_code);
+        status = tg_write_string(writer, TG_MTPROTO_SYSTEM_LANG_CODE);
     }
     if (status == TG_MTPROTO_TL_OK) {
         status = tg_write_string(writer, "");
@@ -6864,6 +6872,16 @@ int tg_mtproto_login_self_test(void)
             TG_MTPROTO_TL_OK ||
         initialized[0] != 0xa9U || initialized[1] != 0x5eU ||
         initialized[2] != 0xcdU || initialized[3] != 0xc1U) {
+        return 2;
+    }
+    /* After flags and api_id come device_model "Amiga" (8 bytes padded),
+       system_version "portable" (12) and app_version "0.1" (4), so offset 36
+       is system_lang_code, then lang_pack and lang_code: pin the full
+       locale that makes Telegram deliver the login code, the empty language
+       pack and the short lang_code. */
+    if (initialized[36] != 5U || memcmp(initialized + 37, "en-US", 5) != 0 ||
+        initialized[44] != 0U ||
+        initialized[48] != 2U || memcmp(initialized + 49, "en", 2) != 0) {
         return 2;
     }
 
