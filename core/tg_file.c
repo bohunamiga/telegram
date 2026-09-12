@@ -66,6 +66,13 @@ tg_file_status tg_file_write_text(const char *path, const char *text,
         return TG_FILE_INVALID_ARGUMENT;
     }
 
+    /* AROS/RPi storage: overwriting an EXISTING file via fopen("wb") truncates
+       the directory entry but the replacement clusters are silently lost (the
+       file ends up 0 bytes on the FAT, and reads are erratic), while creating
+       a brand-new file commits reliably (12 B probe + 422 B peers.txt both
+       persisted). Delete first so every write is a fresh file. */
+    (void)remove(path);
+
     file = fopen(path, "wb");
     if (file == 0) {
         return TG_FILE_OPEN_FAILED;
@@ -73,6 +80,10 @@ tg_file_status tg_file_write_text(const char *path, const char *text,
 
     written = fwrite(text, 1, (size_t)text_length, file);
     if (written != (size_t)text_length || ferror(file)) {
+        fclose(file);
+        return TG_FILE_WRITE_FAILED;
+    }
+    if (fflush(file) != 0) {
         fclose(file);
         return TG_FILE_WRITE_FAILED;
     }
@@ -100,6 +111,10 @@ tg_file_status tg_file_append_text(const char *path, const char *text,
 
     written = fwrite(text, 1, (size_t)text_length, file);
     if (written != (size_t)text_length || ferror(file)) {
+        fclose(file);
+        return TG_FILE_WRITE_FAILED;
+    }
+    if (fflush(file) != 0) {
         fclose(file);
         return TG_FILE_WRITE_FAILED;
     }

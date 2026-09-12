@@ -289,6 +289,27 @@ static int tg_main_body(int argc, char **argv)
             return tg_main_finish(tg_app_run(3, wb_argv));
         }
     }
+    /* AROS Wanderer can start a double-clicked tool as a plain CLI process
+       (empty command line -> argc == 1, argv[0] == tool name) instead of the
+       Workbench argc == 0 form below. With no mode argument the CLI path
+       would just print the bootstrap banner and exit, so route a bare AROS
+       launch through the same GUI arguments the Workbench path uses. */
+#if defined(__AROS__)
+    if (argc == 1) {
+        static char *icon_argv[3];
+        FILE *redir;
+
+        redir = freopen("NIL:", "w", stdout);
+        (void)redir;
+        redir = freopen("NIL:", "w", stderr);
+        (void)redir;
+        tg_platform_workbench_init();
+        icon_argv[0] = "TelegramAmiga";
+        icon_argv[1] = "--gui-live-debug";
+        icon_argv[2] = "data/telegram-peers.txt";
+        return tg_main_finish(tg_app_run(3, icon_argv));
+    }
+#endif
     return tg_main_finish(tg_app_run(argc, argv));
 }
 

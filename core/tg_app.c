@@ -4164,12 +4164,28 @@ int tg_app_run(int argc, char **argv)
         tg_gui_log(rc == 0 ? "live: session open OK" : "live: session open FAIL");
         if (rc != 0) {
             FILE *auth_probe;
+            int auth_empty;
 
-            /* No saved session at all -> drive the first-login flow in the
-               window. An existing-but-unusable auth (network down, expired)
-               keeps the read-only cached sidebar instead. */
+            /* No saved session -> drive the first-login flow in the window. An
+               existing, NON-EMPTY-but-unusable auth (network down, expired)
+               keeps the read-only cached sidebar instead. An empty auth file
+               (e.g. a login that never persisted) is treated like no session:
+               otherwise the user is trapped on an offline sidebar with no way
+               back to the login screen. */
             auth_probe = fopen(config.mtproto_auth_file, "rb");
-            if (auth_probe == 0) {
+            auth_empty = 1;
+            if (auth_probe != 0) {
+                long size;
+
+                if (fseek(auth_probe, 0L, SEEK_END) == 0) {
+                    size = ftell(auth_probe);
+                    if (size > 0L) {
+                        auth_empty = 0;
+                    }
+                }
+                fclose(auth_probe);
+            }
+            if (auth_probe == 0 || auth_empty) {
                 tg_gui_log("live: no auth -> login flow");
                 tg_gui_session_login_begin(config.mtproto_auth_api_file,
                                            config.mtproto_auth_file,

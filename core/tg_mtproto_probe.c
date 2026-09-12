@@ -3977,6 +3977,23 @@ int tg_mtproto_auth_send_code(const char *host,
 
     session_status = tg_mtproto_session_save_authorization(
         auth_file, &context.session, context.auth_key, 1);
+    {
+        char saved_line[96];
+        char readback_buf[8];
+        unsigned long readback_len;
+        sprintf(saved_line, "open: auth save send_code status=%s",
+                tg_mtproto_session_status_name(session_status));
+        tg_gui_log(saved_line);
+        if (tg_file_read_text(auth_file, readback_buf, sizeof(readback_buf),
+                              &readback_len) == TG_FILE_OK) {
+            sprintf(saved_line, "open: auth save send_code readback len=%lu",
+                    readback_len);
+        } else {
+            sprintf(saved_line,
+                    "open: auth save send_code readback read-FAIL");
+        }
+        tg_gui_log(saved_line);
+    }
     if (session_status != TG_MTPROTO_SESSION_OK) {
         fprintf(stream, "%s: auth-file-save-failed (%s)\n", label,
                 tg_mtproto_session_status_name(session_status));
@@ -4025,6 +4042,8 @@ int tg_mtproto_auth_send_code_file(const char *host,
     tg_mtproto_secure_zero(api_hash, sizeof(api_hash));
     return rc;
 }
+
+static long tg_file_probe_size(const char *path);
 
 int tg_mtproto_auth_sign_in(const char *host,
                             const char *port,
@@ -4117,6 +4136,26 @@ int tg_mtproto_auth_sign_in(const char *host,
         if (qrc == TG_MTPROTO_QUERY_SOFT_FAIL) {
             session_status = tg_mtproto_session_save_authorization(
                 auth_file, &context.session, context.auth_key, 1);
+            {
+                char saved_line[96];
+                char readback_buf[8];
+                unsigned long readback_len;
+                sprintf(saved_line,
+                        "open: auth save sign_in softfail status=%s",
+                        tg_mtproto_session_status_name(session_status));
+                tg_gui_log(saved_line);
+                if (tg_file_read_text(auth_file, readback_buf,
+                                      sizeof(readback_buf),
+                                      &readback_len) == TG_FILE_OK) {
+                    sprintf(saved_line,
+                            "open: auth save sign_in softfail readback len=%lu",
+                            readback_len);
+                } else {
+                    sprintf(saved_line,
+                            "open: auth save sign_in softfail readback read-FAIL");
+                }
+                tg_gui_log(saved_line);
+            }
             if (session_status != TG_MTPROTO_SESSION_OK) {
                 fprintf(stream, "%s: auth-file-save-failed (%s)\n", label,
                         tg_mtproto_session_status_name(session_status));
@@ -4130,6 +4169,53 @@ int tg_mtproto_auth_sign_in(const char *host,
 
     session_status = tg_mtproto_session_save_authorization(
         auth_file, &context.session, context.auth_key, 1);
+    {
+        char saved_line[96];
+        char readback_buf[8];
+        unsigned long readback_len;
+        sprintf(saved_line, "open: auth save sign_in status=%s",
+                tg_mtproto_session_status_name(session_status));
+        tg_gui_log(saved_line);
+        if (tg_file_read_text(auth_file, readback_buf, sizeof(readback_buf),
+                              &readback_len) == TG_FILE_OK) {
+            sprintf(saved_line, "open: auth save sign_in readback len=%lu",
+                    readback_len);
+        } else {
+            sprintf(saved_line, "open: auth save sign_in readback read-FAIL");
+        }
+        tg_gui_log(saved_line);
+    }
+    {
+        char probe_line[160];
+        long probe_size;
+        tg_file_status probe_write;
+
+        probe_size = tg_file_probe_size(auth_file);
+        sprintf(probe_line, "open: auth probe relative size=%ld",
+                probe_size);
+        tg_gui_log(probe_line);
+        probe_size = tg_file_probe_size("PROGDIR:telegram-auth.bin");
+        sprintf(probe_line, "open: auth probe absolut size=%ld",
+                probe_size);
+        tg_gui_log(probe_line);
+        probe_write = tg_file_write_text("data/tgfileprobe.txt",
+                                         "hello probe!", 12UL);
+        probe_size = tg_file_probe_size("data/tgfileprobe.txt");
+        sprintf(probe_line, "open: probe newfile write=%s size=%ld",
+                tg_file_status_name(probe_write), probe_size);
+        tg_gui_log(probe_line);
+        {
+            tg_mtproto_session_status retry_status;
+
+            retry_status = tg_mtproto_session_save_authorization(
+                auth_file, &context.session, context.auth_key, 1);
+            probe_size = tg_file_probe_size(auth_file);
+            sprintf(probe_line,
+                    "open: auth save sign_in retry status=%s size=%ld",
+                    tg_mtproto_session_status_name(retry_status), probe_size);
+            tg_gui_log(probe_line);
+        }
+    }
     if (session_status != TG_MTPROTO_SESSION_OK) {
         fprintf(stream, "%s: auth-file-save-failed (%s)\n", label,
                 tg_mtproto_session_status_name(session_status));
@@ -7599,6 +7685,9 @@ static void tg_chat_list_copy_name(char *dest, const char *src)
    The caller then re-parses the cache through tg_mtproto_chat_list_parse.
    Returns 0 when the cache was (re)written or already usable, non-zero when no
    chats could be obtained (the caller falls back to whatever cache exists). */
+static void tg_mtproto_capture_quiet_error(FILE *quiet, FILE *fallback,
+                                           char *out, unsigned long out_size);
+
 int tg_mtproto_gui_refresh_peer_cache(const char *api_file,
                                       const char *auth_file,
                                       const char *peer_cache_file, FILE *stream)
@@ -7640,19 +7729,32 @@ int tg_mtproto_gui_refresh_peer_cache(const char *api_file,
 #else
     {
         FILE *quiet;
+        char error[256];
         int rc;
 
         quiet = tg_mtproto_open_quiet_stream(stream);
         rc = tg_mtproto_auth_list_peers_file(host, "443", api_file, auth_file,
                                              dc_id_text, "5", peer_cache_file,
                                              quiet);
-        tg_mtproto_close_quiet_stream(quiet, stream);
         if (rc != 0 && !tg_mtproto_peer_cache_available(peer_cache_file)) {
+            tg_mtproto_capture_quiet_error(quiet, stream, error,
+                                           sizeof(error));
+            tg_mtproto_close_quiet_stream(quiet, stream);
             quiet = tg_mtproto_open_quiet_stream(stream);
             rc = tg_mtproto_auth_list_peers_file(host, "443", api_file, auth_file,
                                                  dc_id_text, "1", peer_cache_file,
                                                  quiet);
-            tg_mtproto_close_quiet_stream(quiet, stream);
+            if (rc != 0) {
+                tg_mtproto_capture_quiet_error(quiet, stream, error,
+                                               sizeof(error));
+            }
+        }
+        tg_mtproto_close_quiet_stream(quiet, stream);
+        if (rc != 0 && !tg_mtproto_peer_cache_available(peer_cache_file)) {
+            tg_gui_log("live: peers fetch FAILED");
+            if (error[0] != '\0') {
+                tg_gui_log(error);
+            }
         }
         return rc;
     }
@@ -15493,6 +15595,7 @@ int tg_gui_session_open(const char *api_file, const char *auth_file,
     const char *host;
     const char *dc_id_text;
     FILE *quiet;
+    char error[256];
     int rc;
     static const char label[] = "gui session";
 
@@ -15505,6 +15608,19 @@ int tg_gui_session_open(const char *api_file, const char *auth_file,
     /* Derive the production endpoint from the saved session's DC. */
     if (tg_mtproto_session_load_authorization(auth_file, &session, auth_key) !=
         TG_MTPROTO_SESSION_OK) {
+        char open_fail[160];
+        unsigned long open_length;
+        char open_text[1152];
+
+        if (tg_file_read_text(auth_file, open_text, sizeof(open_text),
+                              &open_length) == TG_FILE_OK) {
+            sprintf(open_fail,
+                    "open: auth load FAILED (file %lu bytes, status != ok)",
+                    open_length);
+        } else {
+            sprintf(open_fail, "open: auth load FAILED (file unreadable)");
+        }
+        tg_gui_log(open_fail);
         return 2;
     }
     tg_mtproto_secure_zero(auth_key, sizeof(auth_key));
@@ -15554,6 +15670,7 @@ int tg_gui_session_open(const char *api_file, const char *auth_file,
     tg_gui_session_state.saved_timeout = tg_net_connect_timeout_seconds();
     tg_net_set_connect_timeout_seconds(20UL);
     quiet = tg_mtproto_open_quiet_stream(stream);
+    error[0] = '\0';
     rc = tg_mtproto_load_api_id_file(api_file, tg_gui_session_state.api_id,
                                      sizeof(tg_gui_session_state.api_id), quiet,
                                      label);
@@ -15571,9 +15688,14 @@ int tg_gui_session_open(const char *api_file, const char *auth_file,
                 &tg_gui_session_state.context, quiet, label);
         }
     }
+    tg_mtproto_capture_quiet_error(quiet, stream, error, sizeof(error));
     tg_mtproto_close_quiet_stream(quiet, stream);
     tg_net_set_connect_timeout_seconds(tg_gui_session_state.saved_timeout);
     if (rc != 0) {
+        tg_gui_log("open: connect FAILED");
+        if (error[0] != '\0') {
+            tg_gui_log(error);
+        }
         tg_mtproto_close_auth_context(&tg_gui_session_state.context);
         tg_chat_nq = 0;
         tg_chat_typing_target = 0;
@@ -20106,6 +20228,57 @@ void tg_gui_session_login_begin(const char *api_file, const char *auth_file,
                       "data/phone-code-hash.txt");
 }
 
+/* Reports whether the auth file the login just claimed to have saved is
+   actually readable on disk right now (circumstance diagnostics for the
+   "sign_in OK but auth.bin stays empty/corrupt" bug). */
+static long tg_file_probe_size(const char *path)
+{
+    FILE *file;
+    long size;
+
+    if (path == 0 || path[0] == '\0') {
+        return -1;
+    }
+    file = fopen(path, "rb");
+    if (file == 0) {
+        return -1;
+    }
+    fseek(file, 0, SEEK_END);
+    size = ftell(file);
+    fclose(file);
+    return size;
+}
+
+static void tg_gui_log_auth_reload(const char *stage)
+{
+    tg_mtproto_session session;
+    unsigned char auth_key[TG_MTPROTO_AUTH_KEY_LENGTH];
+    tg_mtproto_session_status status;
+    char log_line[128];
+    unsigned long text_length;
+    char text[1152];
+
+    if (stage == 0 ||
+        tg_gui_session_state.login.auth_file == 0 ||
+        tg_gui_session_state.login.auth_file[0] == '\0') {
+        return;
+    }
+    if (tg_file_read_text(tg_gui_session_state.login.auth_file, text,
+                          sizeof(text), &text_length) != TG_FILE_OK) {
+        sprintf(log_line, "login: %s auth reload: read FAILED", stage);
+        tg_gui_log(log_line);
+        return;
+    }
+    status = tg_mtproto_session_load_authorization(
+        tg_gui_session_state.login.auth_file, &session, auth_key);
+    tg_mtproto_secure_zero(auth_key, sizeof(auth_key));
+    sprintf(log_line,
+            "login: %s auth reload: bytes=%lu status=%s first=%.16s",
+            stage, text_length, tg_mtproto_session_status_name(status),
+            text);
+    tg_gui_log(log_line);
+}
+
 /* The line that answers "where did the code go, and what comes next" from a
    log the user can send us, instead of from a photograph of the window. */
 static void tg_gui_log_sent_code_route(void)
@@ -20167,6 +20340,8 @@ int tg_gui_session_login_send_code(const char *phone, FILE *stream)
                                    tg_gui_session_state.login.auth_file,
                                    tg_gui_session_state.login.code_hash_file,
                                    quiet);
+    tg_gui_log("login: send_code done");
+    tg_gui_log_auth_reload("send_code");
     if (rc > TG_MTPROTO_PHONE_MIGRATE_RC_BASE) {
         unsigned long migrate_dc;
         const char *migrate_host;
@@ -20257,6 +20432,7 @@ int tg_gui_session_login_sign_in(const char *code, FILE *stream)
                                  tg_gui_session_state.login.code_hash_file, code,
                                  tg_gui_session_state.login.dc_id_text, quiet);
     tg_gui_log("login: sign_in done");
+    tg_gui_log_auth_reload("sign_in");
     if (rc != 0 && rc != TG_MTPROTO_SIGN_IN_PASSWORD_NEEDED &&
         rc != TG_MTPROTO_SIGN_IN_CODE_INVALID) {
         tg_mtproto_capture_quiet_error(
